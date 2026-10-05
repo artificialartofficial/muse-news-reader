@@ -1,0 +1,10 @@
+{
+  "entry": "client/dist/index.html",
+  "managedCronJobs": [
+    "news-rss-refresh"
+  ],
+  "name": "News",
+  "platformVersion": 24,
+  "runtime": "typescript",
+  "slug": "news"
+}

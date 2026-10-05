@@ -1,0 +1,11 @@
+node_modules/
+client/dist/
+client/dist-cvm/
+server/dist/
+*.tsbuildinfo
+app.db*
+blobs/
+.space-build/
+.space-build-cvm/
+.bun-cache/
+.DS_Store/
