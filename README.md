@@ -1,7 +1,8 @@
 # Muse News Reader
 
 A personal RSS reader web app: an inbox-first feed reader with themes, a
-distraction-free article reader, keyboard navigation, stars, notes,
+distraction-free article reader with a built-in RSVP speed reader,
+keyboard navigation, stars, notes,
 highlights, full-text search, per-feed settings, OPML import/export, and
 automatic archiving and retention.
 

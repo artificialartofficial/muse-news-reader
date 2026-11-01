@@ -4,7 +4,7 @@
     "news-rss-refresh"
   ],
   "name": "News",
-  "platformVersion": 24,
+  "platformVersion": 26,
   "runtime": "typescript",
   "slug": "news"
 }
