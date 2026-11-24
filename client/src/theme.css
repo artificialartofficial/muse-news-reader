@@ -63,6 +63,8 @@ button:disabled{cursor:default}
 .icon-button:disabled{opacity:.4}
 mark{padding:0 .08em;border-radius:2px;background:#ffd60a;color:#1c1c1e;box-decoration-break:clone;-webkit-box-decoration-break:clone}
 .notice{position:fixed;z-index:90;right:12px;bottom:76px;padding:8px 12px;border:.5px solid var(--border);border-radius:9px;background:color-mix(in srgb,var(--surface-solid) 88%,transparent);color:var(--text);box-shadow:var(--shadow);font-size:12px;backdrop-filter:blur(20px)}
+.offline-queue-notice{display:flex;align-items:center;padding:6px 12px;border-bottom:.5px solid var(--border);background:color-mix(in srgb,var(--accent) 7%,var(--surface-solid));color:var(--dim);font-size:12px;line-height:1.35}
+@media(min-width:800px){.offline-queue-notice{padding-left:19px;padding-right:19px}}
 .main-actions{display:flex;min-height:38px;align-items:center;gap:10px;padding:5px 12px;border-bottom:.5px solid var(--border)}
 .main-actions select{max-width:48%;padding:5px 7px;border:.5px solid var(--border);border-radius:7px;background:var(--surface-solid);font-size:12px}
 .text-button{border:0;background:transparent;color:var(--accent);font-weight:650;padding:4px 0;font-size:13px}
@@ -104,6 +106,14 @@ mark{padding:0 .08em;border-radius:2px;background:#ffd60a;color:#1c1c1e;box-deco
 .row-actions button{border:0;background:transparent;color:var(--dim);font-size:10px;padding:6px}
 .row-actions button.starred,.reader-actions .starred{color:var(--accent)}
 .row-actions button.starred svg,.reader-actions .starred svg{fill:currentColor}
+/* The row star is the primary triage action: give it a near-44px target
+   and a press + pop so a tap is unmistakably registered. */
+.row-actions button.star-button{padding:11px 10px}
+.row-actions button.star-button:active{transform:scale(.86)}
+.row-actions button.star-button{transition:transform .12s ease}
+@keyframes star-pop{0%{transform:scale(1)}40%{transform:scale(1.3)}100%{transform:scale(1)}}
+.row-actions button.star-pop svg{animation:star-pop .28s ease}
+@media(prefers-reduced-motion:reduce){.row-actions button.star-pop svg{animation:none}.row-actions button.star-button{transition:none}}
 .row-actions button.delete-row,.reader-actions button.reader-delete{color:#d70015}
 .state-page{min-height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:5px;padding:28px;color:var(--dim);font-size:14px}
 .state-page strong{font-family:inherit;color:var(--text);font-size:18px}
@@ -321,7 +331,7 @@ mark{padding:0 .08em;border-radius:2px;background:#ffd60a;color:#1c1c1e;box-deco
 /* Swipe-to-archive: the row slides over a reveal; the inner wrapper carries
    the row's background so the reveal is hidden until the row moves. */
 .swipe-row{position:relative;overflow:hidden}
-.swipe-reveal{position:absolute;inset:0;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding-right:20px;background:#ff9500;color:#fff;font-size:13px;font-weight:700;transition:opacity .15s ease}
+.swipe-reveal{position:absolute;inset:0;display:flex;align-items:center;justify-content:flex-start;gap:7px;padding-left:20px;background:#ff9500;color:#fff;font-size:13px;font-weight:700;transition:opacity .15s ease}
 .swipe-inner{position:relative;background:var(--bg)}
 @media(prefers-color-scheme:dark){.swipe-inner{background:var(--bg)}}
 .undo-notice{display:flex;align-items:center;gap:12px;text-align:left;cursor:default}
@@ -516,7 +526,8 @@ mark{padding:0 .08em;border-radius:2px;background:#ffd60a;color:#1c1c1e;box-deco
 .board-card p{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;margin:0;color:var(--dim);font-size:12.5px;line-height:1.4;user-select:text;-webkit-user-select:text}
 .board-card-meta{display:flex;gap:9px;margin-top:7px;color:var(--dim);font-size:10.5px}
 .board-card-author{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.board-star{position:absolute;top:7px;right:7px;display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:50%;background:transparent;color:var(--dim);padding:0}
+.board-star{position:absolute;top:5px;right:5px;display:grid;place-items:center;width:34px;height:34px;border:0;border-radius:50%;background:transparent;color:var(--dim);padding:0}
+.board-star:active{transform:scale(.86)}
 .board-star.starred{color:var(--accent)}
 .board-star.starred svg{fill:currentColor}
 .board-more{display:block;width:100%;padding:10px 12px;border:0;border-top:.5px solid var(--border);background:transparent;color:var(--accent);font-size:12.5px;font-weight:650;text-align:left}

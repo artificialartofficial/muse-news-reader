@@ -3,7 +3,15 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { installCachePersister, restorePersistedCache } from "./cachePersist";
 import "./theme.css";
+
+// Phase 2 (instant open): hydrate the persisted dashboard/board/article
+// cache synchronously so the first paint can render last known data, then
+// keep the snapshot updated as queries settle. Hydrated queries keep their
+// original timestamps and run stale, so they revalidate in the background.
+restorePersistedCache(spaceQueryClient);
+installCachePersister(spaceQueryClient);
 
 const rootEl = document.querySelector<HTMLElement>("[data-generated-space-root]");
 if (!rootEl) {

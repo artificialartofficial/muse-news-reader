@@ -1,9 +1,54 @@
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { and, desc, eq, gt, inArray, isNotNull, isNull, like, lte, notInArray, or, sql, type SQL } from "drizzle-orm";
 import * as schema from "./schema";
+import { privileged } from "@space/privileged";
 
 // Preserve the briefing pipeline and saved data while pausing generation.
 const BRIEFING_ENABLED = false;
+
+// --- Performance instrumentation (Phase 0) --------------------------------
+// Lightweight timing + payload-size samples for the key actions and for
+// client-measured interactions (sent in via log_perf). Samples land in
+// perf_events with the current phase label (settings.perf_phase, default
+// "baseline") so each phase of the speed program can be compared via
+// get_perf_report. Overhead is one small insert per timed call; failures
+// are swallowed so instrumentation can never break or delay the action it
+// measures beyond that insert. No content or user data is recorded.
+async function getPerfPhase(ctx: Ctx): Promise<string> {
+  try {
+    const db = ctx.db<typeof schema>();
+    const [row] = await db.select().from(schema.settings).limit(1);
+    const phase = (row as unknown as { perfPhase?: unknown } | undefined)?.perfPhase;
+    return typeof phase === "string" && phase.trim() ? phase.trim() : "baseline";
+  } catch { return "baseline"; }
+}
+function perfBytesOf(value: unknown): number {
+  try { return new TextEncoder().encode(JSON.stringify(value) ?? "").length; } catch { return 0; }
+}
+async function recordPerf(ctx: Ctx, metric: string, durationMs: number, bytes: number | null, phase?: string): Promise<void> {
+  try {
+    const db = ctx.db<typeof schema>();
+    const ph = phase ?? (await getPerfPhase(ctx));
+    await db.insert(schema.perfEvents).values({ metric, durationMs: Math.max(0, Math.round(durationMs)), bytes, phase: ph });
+    // Bound growth cheaply: roughly 1 in 50 inserts prunes to the newest 5000.
+    if (Math.random() < 0.02) {
+      const keep = await db.select({ id: schema.perfEvents.id }).from(schema.perfEvents).orderBy(desc(schema.perfEvents.id)).limit(5000);
+      const keepIds = keep.map((r) => r.id);
+      if (keepIds.length) await db.delete(schema.perfEvents).where(notInArray(schema.perfEvents.id, keepIds));
+    }
+  } catch { /* Instrumentation must never fail the measured action. */ }
+}
+async function withPerf<T>(ctx: Ctx, metric: string, fn: () => Promise<T>): Promise<T> {
+  const start = performance.now();
+  const result = await fn();
+  await recordPerf(ctx, metric, performance.now() - start, perfBytesOf(result));
+  return result;
+}
+function perfPercentile(sorted: number[], p: number): number {
+  if (!sorted.length) return 0;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+  return sorted[idx] ?? 0;
+}
 
 // Example seed feeds. Replace with your own subscriptions, or import an OPML
 // file through the app's add-feed flow after first launch.
@@ -166,7 +211,7 @@ function imageFormat(bytes:Uint8Array):{mime:"image/jpeg"|"image/png"|"image/gif
   if(bytes.length>=12&&String.fromCharCode(...bytes.slice(0,4))==="RIFF"&&String.fromCharCode(...bytes.slice(8,12))==="WEBP")return{mime:"image/webp",ext:"webp"};
   return null;
 }
-async function ownArticleImage(ctx:Ctx,articleId:number,url:string):Promise<string|null>{
+async function ownArticleImage(ctx:Ctx,articleId:number,url:string):Promise<{key:string;thumbKey:string|null}|null>{
   try{
     const response=await fetch(url,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8,*/*;q=0.1"},signal:AbortSignal.timeout(15000),redirect:"follow"});
     if(!response.ok)return null;
@@ -177,12 +222,22 @@ async function ownArticleImage(ctx:Ctx,articleId:number,url:string):Promise<stri
     const format=imageFormat(bytes); if(!format)return null;
     const key=`article-images/${articleId}.${format.ext}`;
     await ctx.blobs.put(key,bytes,{contentType:format.mime});
-    return key;
+    // Eager list thumbnail (Phase 5): generated once here so list loads
+    // never wait on a resize for newly ingested images. Best-effort: a
+    // failure leaves the thumbnail to the lazy list path.
+    const thumbKey=await ensureThumbnailForKey(ctx,key);
+    return {key,thumbKey};
   }catch{return null;}
 }
 function readMinutes(body: string | null, excerpt: string | null): number {
   const words = plain(body ?? excerpt ?? "").trim().split(/\s+/).filter(Boolean).length;
   return Math.max(1, Math.ceil(words / 230));
+}
+// Exact plain-text word count of a stored body, persisted to
+// articles.word_count at every body write so list queries never scan bodies.
+function bodyWordCount(body: string | null): number {
+  if (!body) return 0;
+  return plain(body).trim().split(/\s+/).filter(Boolean).length;
 }
 
 // --- Full-text fetching -------------------------------------------------
@@ -518,11 +573,127 @@ async function ownPulledPhoto(ctx: Ctx, articleId: number, position: number, url
     return key;
   } catch { return null; }
 }
+// --- Resized list thumbnails (Phase 5) -----------------------------------
+// List slots: inbox rows render the image at 88 CSS px wide on phones and
+// 116 px on desktop, board cards at ~284 px wide (full column width) and
+// 110 px tall. One shared variant at 480 px wide covers the board card at
+// ~1.7x and the inbox thumb at retina 2x with margin, while cutting the
+// transferred bytes by an order of magnitude on typical full-size feed
+// photos. The reader never uses the variant: it keeps the original blob.
+//
+// Generation goes through the privileged resizer (host GraphicsMagick
+// reading the stored blob from disk) and the result is stored as its own
+// blob, so each image is resized at most once. Callers:
+// - eager: ownArticleImage / fetch_photos generate at ingest/pull time;
+// - lazy: dashboard / board schedule background generation for rows
+//   that predate this phase, bounded per request
+//   (THUMB_LAZY_PER_REQUEST). The load itself never waits on a resize:
+//   a row without a thumbnail yet serves its original image (exactly
+//   the pre-Phase-5 behavior) and the variant appears from the next
+//   load onward. backfill_thumbnails can drain the backlog on demand.
+// Reliability: every failure path returns null and the caller serves the
+// original image instead. A thumbnail that is not smaller than its
+// original is discarded and the original key is recorded as the
+// thumbnail, so small images are never re-processed.
+const THUMB_MAX_WIDTH = 480;
+const THUMB_LAZY_PER_REQUEST = 6;
+
+function thumbKeyFor(originalKey: string, ext: string): string {
+  return `thumbs/${originalKey.replace(/\//g, "-")}.${ext}`;
+}
+
+async function ensureThumbnailForKey(ctx: Ctx, originalKey: string): Promise<string | null> {
+  try {
+    const result = await ctx.executePrivileged(privileged.resizeThumbnail, {
+      spaceDir: ctx.spaceDir,
+      blobKey: originalKey,
+      maxWidth: THUMB_MAX_WIDTH,
+    });
+    if (!result.ok) return null;
+    if (result.alreadySmall) return originalKey;
+    if (!result.base64 || !result.ext || !result.contentType) return null;
+    if (result.thumbBytes <= 0 || result.thumbBytes >= result.originalBytes) return originalKey;
+    const bytes = new Uint8Array(Buffer.from(result.base64, "base64"));
+    if (bytes.length !== result.thumbBytes) return null;
+    const key = thumbKeyFor(originalKey, result.ext);
+    await ctx.blobs.put(key, bytes, { contentType: result.contentType });
+    return key;
+  } catch { return null; }
+}
+
+// Deletes a thumbnail blob only when it is a distinct generated variant
+// (a thumbnail key equal to its original key is the original itself).
+async function deleteThumbnailBlob(ctx: Ctx, originalKey: string | null, thumbnailKey: string | null): Promise<void> {
+  if (thumbnailKey && thumbnailKey !== originalKey) {
+    try { await ctx.blobs.delete(thumbnailKey); } catch { /* already gone */ }
+  }
+}
+
+// Article image keys with a background thumbnail generation currently
+// running, so repeated list loads do not schedule duplicate resizes of
+// the same image.
+const thumbGenerationInFlight = new Set<string>();
+
+// Fire-and-forget thumbnail generation for one list row: resizes via the
+// privileged path and persists thumbnail_blob_key when done. Never
+// awaited by the list load that schedules it; any failure (including the
+// continuation being cut short) simply leaves the row on its original
+// image and a later load schedules it again.
+function scheduleThumbnailGeneration(ctx: Ctx, row: { id: number; imageBlobKey: string }): void {
+  const key = row.imageBlobKey;
+  if (thumbGenerationInFlight.has(key)) return;
+  thumbGenerationInFlight.add(key);
+  void (async () => {
+    try {
+      const thumbKey = await ensureThumbnailForKey(ctx, key);
+      if (thumbKey) {
+        const db = ctx.db<typeof schema>();
+        await db.update(schema.articles).set({ thumbnailBlobKey: thumbKey }).where(eq(schema.articles.id, row.id));
+      }
+    } catch { /* background work must never surface; retried on a later load */ } finally {
+      thumbGenerationInFlight.delete(key);
+    }
+  })();
+}
+
+// Resolves the list-view image URL for a batch of article rows: the
+// thumbnail variant when one exists, the original otherwise. Rows whose
+// thumbnail has not been generated yet (everything stored before Phase 5)
+// serve their original on this load, exactly the pre-Phase-5 behavior,
+// and schedule a background generation (bounded to
+// THUMB_LAZY_PER_REQUEST per call, deduped while in flight) so the
+// variant is served from the next load onward. List loads therefore
+// never pay resize latency; the measured Phase 5 probe confirmed that
+// awaiting even a bounded batch of resizes in this path multiplied list
+// latency while the backlog drained, which is why generation moved out
+// of the request path.
+async function listImageUrls(ctx: Ctx, rows: Array<{ id: number; imageBlobKey: string | null; thumbnailBlobKey: string | null }>): Promise<Map<number, string | null>> {
+  const urls = new Map<number, string | null>();
+  let scheduled = 0;
+  for (const r of rows) {
+    if (r.imageBlobKey && !r.thumbnailBlobKey && scheduled < THUMB_LAZY_PER_REQUEST) {
+      scheduleThumbnailGeneration(ctx, { id: r.id, imageBlobKey: r.imageBlobKey });
+      scheduled += 1;
+    }
+    const key = r.thumbnailBlobKey ?? r.imageBlobKey;
+    urls.set(r.id, key ? await ctx.blobs.getUrl(key).catch(() => null) : null);
+    // A stored thumbnail key whose blob vanished falls back to the
+    // original rather than a broken image.
+    if (urls.get(r.id) === null && r.imageBlobKey && key !== r.imageBlobKey) {
+      urls.set(r.id, await ctx.blobs.getUrl(r.imageBlobKey).catch(() => null));
+    }
+  }
+  return urls;
+}
+
 async function deletePhotosForArticles(ctx: Ctx, articleIds: number[]): Promise<void> {
   if (!articleIds.length) return;
   const db = ctx.db<typeof schema>();
-  const rows = await db.select({ blobKey: schema.articlePhotos.blobKey }).from(schema.articlePhotos).where(inArray(schema.articlePhotos.articleId, articleIds));
-  for (const r of rows) await ctx.blobs.delete(r.blobKey);
+  const rows = await db.select({ blobKey: schema.articlePhotos.blobKey, thumbnailBlobKey: schema.articlePhotos.thumbnailBlobKey }).from(schema.articlePhotos).where(inArray(schema.articlePhotos.articleId, articleIds));
+  for (const r of rows) {
+    await ctx.blobs.delete(r.blobKey);
+    await deleteThumbnailBlob(ctx, r.blobKey, r.thumbnailBlobKey);
+  }
   await db.delete(schema.articlePhotos).where(inArray(schema.articlePhotos.articleId, articleIds));
 }
 
@@ -555,7 +726,7 @@ async function deleteExpiredArticles(ctx: Ctx): Promise<number> {
     and(isNull(schema.articles.publishedAt), lte(schema.articles.ingestedAt, cutoff)),
   );
   if (!olderThanCutoff) return 0;
-  const rows = await db.select({ id: schema.articles.id, feedId: schema.articles.feedId, guid: schema.articles.guid, imageBlobKey: schema.articles.imageBlobKey })
+  const rows = await db.select({ id: schema.articles.id, feedId: schema.articles.feedId, guid: schema.articles.guid, imageBlobKey: schema.articles.imageBlobKey, thumbnailBlobKey: schema.articles.thumbnailBlobKey })
     .from(schema.articles)
     .innerJoin(schema.feeds, eq(schema.articles.feedId, schema.feeds.id))
     .leftJoin(schema.notes, eq(schema.notes.articleId, schema.articles.id))
@@ -574,6 +745,7 @@ async function deleteExpiredArticles(ctx: Ctx): Promise<number> {
   }
   for (const row of unique) {
     if (row.imageBlobKey) await ctx.blobs.delete(row.imageBlobKey);
+    await deleteThumbnailBlob(ctx, row.imageBlobKey, row.thumbnailBlobKey);
   }
   await deletePhotosForArticles(ctx, unique.map((row) => row.id));
   for (let index = 0; index < unique.length; index += 200) {
@@ -626,7 +798,7 @@ async function pruneHousekeeping(ctx: Ctx): Promise<void> {
   if (staleDigestIds.length) await db.delete(schema.digests).where(inArray(schema.digests.id, staleDigestIds));
 }
 
-async function runRefresh(ctx: Ctx): Promise<{new_count:number;error_count:number;started_at:string;completed_at:string}> {
+async function runRefreshInner(ctx: Ctx): Promise<{new_count:number;error_count:number;started_at:string;completed_at:string}> {
   await ensureCatalog(ctx); await autoArchive(ctx); await deleteExpiredArticles(ctx); await pruneHousekeeping(ctx);
   const db = ctx.db<typeof schema>(); const started = new Date();
   const [run] = await db.insert(schema.pullRuns).values({ startedAt: started, status: "running" }).returning({id:schema.pullRuns.id});
@@ -648,7 +820,7 @@ async function runRefresh(ctx: Ctx): Promise<{new_count:number;error_count:numbe
     const deletedGuids = new Set(deletedRows.map((row) => row.guid));
     for (const item of result.items) {
       if (deletedGuids.has(item.guid)) continue;
-      const inserted = await db.insert(schema.articles).values({feedId:result.feedId,guid:item.guid,url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,publishedAt:item.published}).onConflictDoNothing().returning({id:schema.articles.id});
+      const inserted = await db.insert(schema.articles).values({feedId:result.feedId,guid:item.guid,url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,wordCount:bodyWordCount(item.body),publishedAt:item.published}).onConflictDoNothing().returning({id:schema.articles.id});
       const created=inserted[0];
       if (created) {
         newCount += 1; const m=meta.get(result.feedId);
@@ -657,7 +829,7 @@ async function runRefresh(ctx: Ctx): Promise<{new_count:number;error_count:numbe
       } else {
         const [existing]=await db.select({id:schema.articles.id,imageBlobKey:schema.articles.imageBlobKey}).from(schema.articles).where(and(eq(schema.articles.feedId,result.feedId),eq(schema.articles.guid,item.guid))).limit(1);
         if(existing){
-          await db.update(schema.articles).set({url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,publishedAt:item.published}).where(eq(schema.articles.id,existing.id));
+          await db.update(schema.articles).set({url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,wordCount:bodyWordCount(item.body),publishedAt:item.published}).where(eq(schema.articles.id,existing.id));
           if(item.imageUrl&&!existing.imageBlobKey)imageCandidates.push({articleId:existing.id,url:item.imageUrl,alt:item.imageAlt??item.title,isNew:false});
         }
       }
@@ -666,9 +838,9 @@ async function runRefresh(ctx: Ctx): Promise<{new_count:number;error_count:numbe
   const runId=run?.id??0;
   const selectedImages=imageCandidates.sort((a,b)=>a.isNew===b.isNew?((a.articleId+runId)%997)-((b.articleId+runId)%997):a.isNew?-1:1).slice(0,160);
   await concurrentMap(selectedImages,async candidate=>{
-    const key=await ownArticleImage(ctx,candidate.articleId,candidate.url);
-    if(key)await db.update(schema.articles).set({imageBlobKey:key,imageAlt:candidate.alt}).where(eq(schema.articles.id,candidate.articleId));
-    return key;
+    const owned=await ownArticleImage(ctx,candidate.articleId,candidate.url);
+    if(owned)await db.update(schema.articles).set({imageBlobKey:owned.key,thumbnailBlobKey:owned.thumbKey,imageAlt:candidate.alt}).where(eq(schema.articles.id,candidate.articleId));
+    return owned;
   },6);
   const completed=new Date(); const status = errorCount === 0 ? "complete" : newCount > 0 ? "partial" : "failed";
   if (run) await db.update(schema.pullRuns).set({completedAt:completed,newCount,errorCount,status}).where(eq(schema.pullRuns.id,run.id));
@@ -682,9 +854,56 @@ async function runRefresh(ctx: Ctx): Promise<{new_count:number;error_count:numbe
   }
   ctx.invalidateQueries(); return {new_count:newCount,error_count:errorCount,started_at:started.toISOString(),completed_at:completed.toISOString()};
 }
+async function runRefresh(ctx: Ctx): Promise<{new_count:number;error_count:number;started_at:string;completed_at:string}> {
+  return withPerf(ctx, "refresh_feeds", () => runRefreshInner(ctx));
+}
 
 function articleOut(row: {id:number;title:string;url:string;author:string|null;excerpt:string|null;imageAlt:string|null;publishedAt:Date|null;ingestedAt:Date;readAt:Date|null;archivedAt:Date|null;starred:boolean;feedId:number;feed:string;theme:string;body?:string|null},imageUrl:string|null) {
   return {id:row.id,title:row.title,url:row.url,author:row.author,excerpt:row.excerpt,image_url:imageUrl,image_alt:row.imageAlt,published_at:iso(row.publishedAt),ingested_at:row.ingestedAt.toISOString(),read_at:iso(row.readAt),archived_at:iso(row.archivedAt),starred:row.starred,feed_id:row.feedId,feed:row.feed,theme:row.theme,read_minutes:readMinutes(row.body ?? null,row.excerpt)};
+}
+
+// --- Slim list payloads (Phase 1) ----------------------------------------
+// List views (dashboard, board) never ship article bodies: the full body is
+// fetched once via getArticle when an article is opened. To keep the rows
+// complete without transferring bodies into JS memory, the list queries
+// read_minutes comes from articles.word_count, the exact plain-text word
+// count persisted at every body write (see bodyWordCount), so list queries
+// touch no body text at all for it. (An earlier version of this phase
+// computed an approximate count in SQL with nested replace() passes over
+// every row's full body; the Phase 1 probe showed that scan made the list
+// endpoints slower than the baseline they were meant to beat, so the count
+// moved to write time. Migration 0014 backfilled existing rows with that
+// SQL approximation; rows pick up the exact count on their next write.)
+// Lists still pull a short body head, only for rows whose feed excerpt is
+// empty, so a meaningful excerpt can be derived server-side. The excerpt
+// itself is truncated for lists: rows clamp it to 2 lines (board cards 3),
+// so 240 chars fills every clamp without shipping the stored excerpt whole.
+// An image_alt that merely repeats the title is dropped (clients already
+// treat that case as empty alt).
+const LIST_EXCERPT_CHARS = 240;
+const listBodyHead = sql<string | null>`case when ${schema.articles.excerpt} is null or trim(${schema.articles.excerpt}) = '' then substr(${schema.articles.body}, 1, 1200) else null end`;
+function readMinutesFromWords(words: number, excerpt: string | null): number {
+  const w = words > 0 ? words : (excerpt ?? "").trim().split(/\s+/).filter(Boolean).length;
+  return Math.max(1, Math.ceil(w / 230));
+}
+// Truncate on a word boundary with an ellipsis, never mid-word.
+function truncateListExcerpt(text: string): string {
+  if (text.length <= LIST_EXCERPT_CHARS) return text;
+  const cut = text.slice(0, LIST_EXCERPT_CHARS);
+  const lastSpace = cut.lastIndexOf(" ");
+  return `${(lastSpace > 40 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+}
+function listExcerpt(excerpt: string | null, bodyHead: string | null, title: string): string | null {
+  if (excerpt && excerpt.trim()) return truncateListExcerpt(excerpt);
+  if (bodyHead) {
+    const derived = cleanExcerpt(plain(bodyHead), title);
+    return derived ? truncateListExcerpt(derived) : null;
+  }
+  return excerpt;
+}
+function articleListOut(row: {id:number;title:string;url:string;author:string|null;excerpt:string|null;bodyHead:string|null;bodyWords:number|null;imageAlt:string|null;publishedAt:Date|null;ingestedAt:Date;readAt:Date|null;archivedAt:Date|null;starred:boolean;feedId:number;feed:string;theme:string},imageUrl:string|null) {
+  const excerpt = listExcerpt(row.excerpt, row.bodyHead, row.title);
+  return {id:row.id,title:row.title,url:row.url,author:row.author,excerpt,image_url:imageUrl,image_alt:row.imageAlt && row.imageAlt !== row.title ? row.imageAlt : null,published_at:iso(row.publishedAt),ingested_at:row.ingestedAt.toISOString(),read_at:iso(row.readAt),archived_at:iso(row.archivedAt),starred:row.starred,feed_id:row.feedId,feed:row.feed,theme:row.theme,read_minutes:readMinutesFromWords(Number(row.bodyWords ?? 0), excerpt)};
 }
 
 type LibraryItem = {id:number;kind:"note"|"highlight";text:string;created_at:string;article_id:number;article_title:string;article_url:string;feed:string;theme:string};
@@ -907,8 +1126,8 @@ async function loadLibrary(ctx:Ctx, search:string):Promise<LibraryItem[]> {
 }
 
 export const Actions = {
-  initializeAndRefresh: defineAction({ description: "Initializes the feed catalog if needed and refreshes all active feeds.", request:z.object({}), response:z.object({new_count:z.number(),error_count:z.number(),started_at:z.string(),completed_at:z.string()}), handler:runRefresh }),
-  refresh_feeds: defineAction({ description: "Refreshes all active, unmuted RSS and Atom feeds and records the pull result.", request:z.object({}), response:z.object({new_count:z.number(),error_count:z.number(),started_at:z.string(),completed_at:z.string()}), handler:runRefresh }),
+  initializeAndRefresh: defineAction({ description: "Initializes the feed catalog if needed and refreshes all active feeds.", request:z.object({}), response:z.object({new_count:z.number(),error_count:z.number(),started_at:z.string(),completed_at:z.string()}), privileged:[privileged.resizeThumbnail], handler:runRefresh }),
+  refresh_feeds: defineAction({ description: "Refreshes all active, unmuted RSS and Atom feeds and records the pull result.", request:z.object({}), response:z.object({new_count:z.number(),error_count:z.number(),started_at:z.string(),completed_at:z.string()}), privileged:[privileged.resizeThumbnail], handler:runRefresh }),
   repair_marginal_links: defineAction({
     description: "Repairs saved Marginal Revolution article links from the current feed entries.", request:z.object({}),response:z.object({updated:z.number(),error:z.string().nullable()}),
     async handler(ctx){
@@ -919,7 +1138,7 @@ export const Actions = {
       if(!result.ok)return{updated:0,error:result.error};
       let updated=0;
       for(const item of result.items){
-        const rows=await db.update(schema.articles).set({url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,publishedAt:item.published}).where(and(eq(schema.articles.feedId,feed.id),eq(schema.articles.guid,item.guid))).returning({id:schema.articles.id});
+        const rows=await db.update(schema.articles).set({url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,wordCount:bodyWordCount(item.body),publishedAt:item.published}).where(and(eq(schema.articles.feedId,feed.id),eq(schema.articles.guid,item.guid))).returning({id:schema.articles.id});
         updated+=rows.length;
       }
       ctx.invalidateQueries();
@@ -928,13 +1147,17 @@ export const Actions = {
   }),
 
   dashboard: defineAction({
-    description: "Returns themes, feeds, articles, digest, and settings for the requested reader view.", request:z.object({view:z.enum(["Main","Theme","Feed","Starred","Archive"]).default("Main"),theme:z.string().optional(),feed_id:z.number().int().optional(),search:z.string().default(""),limit:z.number().int().min(1).max(250).default(80)}), response:dashboardResponse,
+    description: "Returns themes, feeds, articles, digest, and settings for the requested reader view.", request:z.object({view:z.enum(["Main","Theme","Feed","Starred","Archive"]).default("Main"),theme:z.string().optional(),feed_id:z.number().int().optional(),search:z.string().default(""),limit:z.number().int().min(1).max(250).default(80)}), response:dashboardResponse, privileged:[privileged.resizeThumbnail],
     async handler(ctx,args):Promise<z.infer<typeof dashboardResponse>> {
-      // Read-only load path: no maintenance writes here. autoArchive and
+      return withPerf(ctx, "dashboard", async (): Promise<z.infer<typeof dashboardResponse>> => {
+      // No maintenance writes here. autoArchive and
       // deleteExpiredArticles (which sequentially deletes expired articles'
       // image blobs) run in runRefresh on the 30-minute schedule instead;
       // doing them on every dashboard load made inbox loads slow and caused
       // intermittent 500s when they collided with a running refresh.
+      // (listImageUrls may schedule bounded Phase 5 thumbnail generation
+      // for pre-existing rows, but that work runs in the background after
+      // the response and is never awaited by this load.)
       await ensureCatalog(ctx); const db=ctx.db<typeof schema>();
       const feedRows=await db.select({id:schema.feeds.id,title:schema.feeds.title,url:schema.feeds.url,theme:schema.themes.name,themeId:schema.themes.id,muted:schema.feeds.muted,keepForever:schema.feeds.keepForever,fetchError:schema.feeds.fetchError,lastFetchedAt:schema.feeds.lastFetchedAt}).from(schema.feeds).innerJoin(schema.themes,eq(schema.feeds.themeId,schema.themes.id));
       const countRows=await db.select({feedId:schema.articles.feedId,unread:sql<number>`sum(case when ${schema.articles.readAt} is null and ${schema.articles.archivedAt} is null then 1 else 0 end)`}).from(schema.articles).groupBy(schema.articles.feedId);
@@ -949,12 +1172,14 @@ export const Actions = {
       if (args.view==="Starred") conditions.push(eq(schema.articles.starred,true));
       if (args.view==="Archive") conditions.push(isNotNull(schema.articles.archivedAt));
       const q=args.search.trim(); if(q){const p=`%${q}%`; conditions.push(or(like(schema.articles.title,p),like(schema.articles.excerpt,p),like(schema.articles.body,p),like(schema.feeds.title,p))!);}
-      const rows=await db.select({id:schema.articles.id,title:schema.articles.title,url:schema.articles.url,author:schema.articles.author,excerpt:schema.articles.excerpt,body:schema.articles.body,imageBlobKey:schema.articles.imageBlobKey,imageAlt:schema.articles.imageAlt,publishedAt:schema.articles.publishedAt,ingestedAt:schema.articles.ingestedAt,readAt:schema.articles.readAt,archivedAt:schema.articles.archivedAt,starred:schema.articles.starred,feedId:schema.feeds.id,feed:schema.feeds.title,theme:schema.themes.name}).from(schema.articles).innerJoin(schema.feeds,eq(schema.articles.feedId,schema.feeds.id)).innerJoin(schema.themes,eq(schema.feeds.themeId,schema.themes.id)).where(conditions.length?and(...conditions):undefined).orderBy(desc(sql`coalesce(${schema.articles.publishedAt}, ${schema.articles.ingestedAt})`)).limit(args.limit);
-      const articles=await Promise.all(rows.map(async row=>articleOut(row,row.imageBlobKey?await ctx.blobs.getUrl(row.imageBlobKey):null)));
+      const rows=await db.select({id:schema.articles.id,title:schema.articles.title,url:schema.articles.url,author:schema.articles.author,excerpt:schema.articles.excerpt,bodyHead:listBodyHead,bodyWords:schema.articles.wordCount,imageBlobKey:schema.articles.imageBlobKey,thumbnailBlobKey:schema.articles.thumbnailBlobKey,imageAlt:schema.articles.imageAlt,publishedAt:schema.articles.publishedAt,ingestedAt:schema.articles.ingestedAt,readAt:schema.articles.readAt,archivedAt:schema.articles.archivedAt,starred:schema.articles.starred,feedId:schema.feeds.id,feed:schema.feeds.title,theme:schema.themes.name}).from(schema.articles).innerJoin(schema.feeds,eq(schema.articles.feedId,schema.feeds.id)).innerJoin(schema.themes,eq(schema.feeds.themeId,schema.themes.id)).where(conditions.length?and(...conditions):undefined).orderBy(desc(sql`coalesce(${schema.articles.publishedAt}, ${schema.articles.ingestedAt})`)).limit(args.limit);
+      const imageUrls=await listImageUrls(ctx,rows);
+      const articles=rows.map(row=>articleListOut(row,imageUrls.get(row.id)??null));
       const digestKey=args.view==="Theme"&&args.theme?args.theme:"Main";
       const [digest]=await db.select().from(schema.digests).where(eq(schema.digests.theme,digestKey)).orderBy(desc(schema.digests.createdAt)).limit(1);
       const [prefs]=await db.select().from(schema.settings).limit(1); const [pull]=await db.select().from(schema.pullRuns).orderBy(desc(schema.pullRuns.id)).limit(1);
       return {themes,feeds,articles,digest:digest?{markdown:digest.markdown,created_at:digest.createdAt.toISOString()}:null,archive_days:prefs?.archiveDays??7,retention_days:prefs?.retentionDays??30,last_pull:pull?{completed_at:iso(pull.completedAt),new_count:pull.newCount,error_count:pull.errorCount}:null};
+      });
     }
   }),
 
@@ -965,7 +1190,9 @@ export const Actions = {
       columns: z.array(z.object({ id: z.number(), name: z.string(), unread: z.number(), articles: z.array(articleSchema) })),
       last_pull: z.object({ completed_at: z.string().nullable(), new_count: z.number(), error_count: z.number() }).nullable(),
     }),
+    privileged: [privileged.resizeThumbnail],
     async handler(ctx, args) {
+      return withPerf(ctx, "board", async () => {
       await ensureCatalog(ctx);
       const db = ctx.db<typeof schema>();
       const themeRows = await db.select().from(schema.themes).orderBy(schema.themes.position);
@@ -982,25 +1209,34 @@ export const Actions = {
       // window's tail renders empty or stale even though it has unread
       // articles. Per-theme queries also cut the rows read from ~800 full
       // bodies to at most themes x per_theme.
-      const columns = await Promise.all(themeRows.map(async (t) => {
+      const lists = await Promise.all(themeRows.map(async (t) => {
         const conditions: SQL<unknown>[] = [isNull(schema.articles.readAt), isNull(schema.articles.archivedAt), eq(schema.feeds.muted, false), eq(schema.themes.id, t.id)];
         if (q) { const p = `%${q}%`; const searchCond = or(like(schema.articles.title, p), like(schema.articles.excerpt, p), like(schema.articles.body, p), like(schema.feeds.title, p)); if (searchCond) conditions.push(searchCond); }
-        const list = await db.select({ id: schema.articles.id, title: schema.articles.title, url: schema.articles.url, author: schema.articles.author, excerpt: schema.articles.excerpt, body: schema.articles.body, imageBlobKey: schema.articles.imageBlobKey, imageAlt: schema.articles.imageAlt, publishedAt: schema.articles.publishedAt, ingestedAt: schema.articles.ingestedAt, readAt: schema.articles.readAt, archivedAt: schema.articles.archivedAt, starred: schema.articles.starred, feedId: schema.feeds.id, feed: schema.feeds.title, theme: schema.themes.name, themeId: schema.themes.id }).from(schema.articles).innerJoin(schema.feeds, eq(schema.articles.feedId, schema.feeds.id)).innerJoin(schema.themes, eq(schema.feeds.themeId, schema.themes.id)).where(and(...conditions)).orderBy(desc(sql`coalesce(${schema.articles.publishedAt}, ${schema.articles.ingestedAt})`)).limit(args.per_theme);
-        const articles = await Promise.all(list.map(async (row) => articleOut(row, row.imageBlobKey ? await ctx.blobs.getUrl(row.imageBlobKey) : null)));
-        return { id: t.id, name: t.name, unread: unreadByTheme.get(t.id) ?? 0, articles };
+        return db.select({ id: schema.articles.id, title: schema.articles.title, url: schema.articles.url, author: schema.articles.author, excerpt: schema.articles.excerpt, bodyHead: listBodyHead, bodyWords: schema.articles.wordCount, imageBlobKey: schema.articles.imageBlobKey, thumbnailBlobKey: schema.articles.thumbnailBlobKey, imageAlt: schema.articles.imageAlt, publishedAt: schema.articles.publishedAt, ingestedAt: schema.articles.ingestedAt, readAt: schema.articles.readAt, archivedAt: schema.articles.archivedAt, starred: schema.articles.starred, feedId: schema.feeds.id, feed: schema.feeds.title, theme: schema.themes.name, themeId: schema.themes.id }).from(schema.articles).innerJoin(schema.feeds, eq(schema.articles.feedId, schema.feeds.id)).innerJoin(schema.themes, eq(schema.feeds.themeId, schema.themes.id)).where(and(...conditions)).orderBy(desc(sql`coalesce(${schema.articles.publishedAt}, ${schema.articles.ingestedAt})`)).limit(args.per_theme);
       }));
+      // One shared background-thumbnail budget across all columns
+      // (Phase 5), so a cold board cannot fan out into dozens of
+      // background resizes at once; the load itself never waits on one.
+      const imageUrls = await listImageUrls(ctx, lists.flat());
+      const columns = themeRows.map((t, i) => {
+        const list = lists[i] ?? [];
+        const articles = list.map((row) => articleListOut(row, imageUrls.get(row.id) ?? null));
+        return { id: t.id, name: t.name, unread: unreadByTheme.get(t.id) ?? 0, articles };
+      });
       const [pull] = await db.select().from(schema.pullRuns).orderBy(desc(schema.pullRuns.id)).limit(1);
       return { columns, last_pull: pull ? { completed_at: iso(pull.completedAt), new_count: pull.newCount, error_count: pull.errorCount } : null };
+      });
     }
   }),
 
-  getArticle: defineAction({description: "Returns one article with its full body, note, and highlights.", request:z.object({id:z.number().int()}),response:z.object({article:articleSchema.extend({body:z.string().nullable(),note:z.string().nullable(),highlights:z.array(z.object({id:z.number(),text:z.string(),created_at:z.string()})),photos:z.array(z.object({id:z.number(),url:z.string(),caption:z.string().nullable(),credit:z.string().nullable(),alt:z.string().nullable(),position:z.number()}))})}),async handler(ctx,args){const db=ctx.db<typeof schema>();const [row]=await db.select({id:schema.articles.id,title:schema.articles.title,url:schema.articles.url,author:schema.articles.author,excerpt:schema.articles.excerpt,body:schema.articles.body,imageBlobKey:schema.articles.imageBlobKey,imageAlt:schema.articles.imageAlt,publishedAt:schema.articles.publishedAt,ingestedAt:schema.articles.ingestedAt,readAt:schema.articles.readAt,archivedAt:schema.articles.archivedAt,starred:schema.articles.starred,feedId:schema.feeds.id,feed:schema.feeds.title,theme:schema.themes.name}).from(schema.articles).innerJoin(schema.feeds,eq(schema.articles.feedId,schema.feeds.id)).innerJoin(schema.themes,eq(schema.feeds.themeId,schema.themes.id)).where(eq(schema.articles.id,args.id)).limit(1);if(!row) throw new Error("Article not found");const [note]=await db.select().from(schema.notes).where(eq(schema.notes.articleId,args.id)).orderBy(desc(schema.notes.updatedAt)).limit(1);const hs=await db.select().from(schema.highlights).where(eq(schema.highlights.articleId,args.id)).orderBy(desc(schema.highlights.createdAt));const imageUrl=row.imageBlobKey?await ctx.blobs.getUrl(row.imageBlobKey):null;const photoRows=await db.select().from(schema.articlePhotos).where(eq(schema.articlePhotos.articleId,args.id)).orderBy(schema.articlePhotos.position);const photos=await Promise.all(photoRows.map(async p=>({id:p.id,url:await ctx.blobs.getUrl(p.blobKey),caption:p.caption,credit:p.credit,alt:p.alt,position:p.position})));return{article:{...articleOut(row,imageUrl),body:row.body,note:note?.text??null,highlights:hs.map(h=>({id:h.id,text:h.text,created_at:h.createdAt.toISOString()})),photos}};}}),
+  getArticle: defineAction({description: "Returns one article with its full body, note, and highlights.", request:z.object({id:z.number().int()}),response:z.object({article:articleSchema.extend({body:z.string().nullable(),note:z.string().nullable(),highlights:z.array(z.object({id:z.number(),text:z.string(),created_at:z.string()})),photos:z.array(z.object({id:z.number(),url:z.string(),caption:z.string().nullable(),credit:z.string().nullable(),alt:z.string().nullable(),position:z.number()}))})}),async handler(ctx,args){return withPerf(ctx, "getArticle", async () => {const db=ctx.db<typeof schema>();const [row]=await db.select({id:schema.articles.id,title:schema.articles.title,url:schema.articles.url,author:schema.articles.author,excerpt:schema.articles.excerpt,body:schema.articles.body,imageBlobKey:schema.articles.imageBlobKey,imageAlt:schema.articles.imageAlt,publishedAt:schema.articles.publishedAt,ingestedAt:schema.articles.ingestedAt,readAt:schema.articles.readAt,archivedAt:schema.articles.archivedAt,starred:schema.articles.starred,feedId:schema.feeds.id,feed:schema.feeds.title,theme:schema.themes.name}).from(schema.articles).innerJoin(schema.feeds,eq(schema.articles.feedId,schema.feeds.id)).innerJoin(schema.themes,eq(schema.feeds.themeId,schema.themes.id)).where(eq(schema.articles.id,args.id)).limit(1);if(!row) throw new Error("Article not found");const [note]=await db.select().from(schema.notes).where(eq(schema.notes.articleId,args.id)).orderBy(desc(schema.notes.updatedAt)).limit(1);const hs=await db.select().from(schema.highlights).where(eq(schema.highlights.articleId,args.id)).orderBy(desc(schema.highlights.createdAt));const imageUrl=row.imageBlobKey?await ctx.blobs.getUrl(row.imageBlobKey):null;const photoRows=await db.select().from(schema.articlePhotos).where(eq(schema.articlePhotos.articleId,args.id)).orderBy(schema.articlePhotos.position);const photos=await Promise.all(photoRows.map(async p=>({id:p.id,url:await ctx.blobs.getUrl(p.blobKey),caption:p.caption,credit:p.credit,alt:p.alt,position:p.position})));return{article:{...articleOut(row,imageUrl),body:row.body,note:note?.text??null,highlights:hs.map(h=>({id:h.id,text:h.text,created_at:h.createdAt.toISOString()})),photos}};});}}),
 
   fetch_full_text: defineAction({
     description: "Fetches an article's original page server-side, extracts the main article text, and saves it as the article body when it is longer than the stored snippet.",
     request: z.object({ id: z.number().int() }),
     response: z.object({ ok: z.boolean(), body_chars: z.number(), error: z.string().nullable() }),
     async handler(ctx, args): Promise<{ ok: boolean; body_chars: number; error: string | null }> {
+      return withPerf(ctx, "fetch_full_text", async (): Promise<{ ok: boolean; body_chars: number; error: string | null }> => {
       const db = ctx.db<typeof schema>();
       const [row] = await db.select({ id: schema.articles.id, url: schema.articles.url, body: schema.articles.body }).from(schema.articles).where(eq(schema.articles.id, args.id)).limit(1);
       if (!row) return { ok: false, body_chars: 0, error: "That article is no longer available." };
@@ -1020,9 +1256,10 @@ export const Actions = {
       const extractedChars = extracted ? plain(extracted).length : 0;
       if (!extracted || extractedChars < FULL_TEXT_MIN_CHARS) return { ok: false, body_chars: existingChars, error: "Couldn't fetch the full text for this article." };
       if (extractedChars <= existingChars) return { ok: false, body_chars: existingChars, error: "The source page didn't return more text than the feed already provided." };
-      await db.update(schema.articles).set({ body: extracted }).where(eq(schema.articles.id, row.id));
+      await db.update(schema.articles).set({ body: extracted, wordCount: bodyWordCount(extracted) }).where(eq(schema.articles.id, row.id));
       ctx.invalidateQueries();
       return { ok: true, body_chars: extractedChars, error: null };
+      });
     },
   }),
 
@@ -1030,7 +1267,9 @@ export const Actions = {
     description: "Fetches an article's original page server-side, extracts the story's photos in story order with captions and credits, stores them as owned blobs with the article, and sets the lead photo as the article image when it has none.",
     request: z.object({ id: z.number().int() }),
     response: z.object({ ok: z.boolean(), count: z.number(), error: z.string().nullable() }),
+    privileged: [privileged.resizeThumbnail],
     async handler(ctx, args): Promise<{ ok: boolean; count: number; error: string | null }> {
+      return withPerf(ctx, "fetch_photos", async (): Promise<{ ok: boolean; count: number; error: string | null }> => {
       const db = ctx.db<typeof schema>();
       const [row] = await db.select({ id: schema.articles.id, url: schema.articles.url, imageBlobKey: schema.articles.imageBlobKey, imageAlt: schema.articles.imageAlt }).from(schema.articles).where(eq(schema.articles.id, args.id)).limit(1);
       if (!row) return { ok: false, count: 0, error: "That article is no longer available." };
@@ -1059,32 +1298,36 @@ export const Actions = {
         if (key) saved.push({ candidate, key });
       }
       if (!saved.length) return { ok: false, count: 0, error: "No usable photos could be saved from the source page." };
+      // Eager list thumbnails for the pulled photos (Phase 5), generated
+      // once here alongside the photos themselves; best-effort per photo.
+      const thumbKeys = await Promise.all(saved.map((s) => ensureThumbnailForKey(ctx, s.key)));
       for (let i = 0; i < saved.length; i += 1) {
         const s = saved[i];
         if (!s) continue;
-        await db.insert(schema.articlePhotos).values({ articleId: row.id, blobKey: s.key, sourceUrl: s.candidate.url, caption: s.candidate.caption, credit: s.candidate.credit, alt: s.candidate.alt, position: i });
+        await db.insert(schema.articlePhotos).values({ articleId: row.id, blobKey: s.key, thumbnailBlobKey: thumbKeys[i] ?? null, sourceUrl: s.candidate.url, caption: s.candidate.caption, credit: s.candidate.credit, alt: s.candidate.alt, position: i });
       }
       // The lead photo doubles as the article's thumbnail/reader image when
       // the feed supplied none; an existing feed image is never overwritten.
       const lead = saved[0];
       if (!row.imageBlobKey && lead) {
-        await db.update(schema.articles).set({ imageBlobKey: lead.key, imageAlt: lead.candidate.alt ?? lead.candidate.caption ?? row.imageAlt }).where(eq(schema.articles.id, row.id));
+        await db.update(schema.articles).set({ imageBlobKey: lead.key, thumbnailBlobKey: thumbKeys[0] ?? null, imageAlt: lead.candidate.alt ?? lead.candidate.caption ?? row.imageAlt }).where(eq(schema.articles.id, row.id));
       }
       ctx.invalidateQueries();
       return { ok: true, count: saved.length, error: null };
+      });
     },
   }),
 
   finishReading: defineAction({description: "Marks the given articles as read and archived when the reader closes.", request:z.object({ids:z.array(z.number().int()).min(1).max(120)}),response:z.object({updated:z.number()}),async handler(ctx,args){const ids=[...new Set(args.ids)];const changedAt=new Date();const updated=await ctx.db<typeof schema>().update(schema.articles).set({readAt:changedAt,archivedAt:changedAt}).where(and(inArray(schema.articles.id,ids),isNull(schema.articles.readAt))).returning({id:schema.articles.id});ctx.invalidateQueries();return{updated:updated.length};}}),
 
-  setArticleState: defineAction({description: "Updates an article's read, starred, or archived state.", request:z.object({id:z.number().int(),read:z.boolean().optional(),starred:z.boolean().optional(),archived:z.boolean().optional()}),response:z.object({ok:z.boolean()}),async handler(ctx,args){const db=ctx.db<typeof schema>();const values:{readAt?:Date|null;starred?:boolean;archivedAt?:Date|null}={};if(args.read!==undefined){const changedAt=args.read?new Date():null;values.readAt=changedAt;values.archivedAt=changedAt;}if(args.starred!==undefined) values.starred=args.starred;if(args.archived!==undefined){const changedAt=args.archived?new Date():null;values.archivedAt=changedAt;if(args.read===undefined)values.readAt=changedAt;}await db.update(schema.articles).set(values).where(eq(schema.articles.id,args.id));ctx.invalidateQueries();return{ok:true};}}),
+  setArticleState: defineAction({description: "Updates an article's read, starred, or archived state.", request:z.object({id:z.number().int(),read:z.boolean().optional(),starred:z.boolean().optional(),archived:z.boolean().optional()}),response:z.object({ok:z.boolean()}),async handler(ctx,args){return withPerf(ctx, "setArticleState", async () => {const db=ctx.db<typeof schema>();const values:{readAt?:Date|null;starred?:boolean;archivedAt?:Date|null}={};if(args.read!==undefined){const changedAt=args.read?new Date():null;values.readAt=changedAt;values.archivedAt=changedAt;}if(args.starred!==undefined) values.starred=args.starred;if(args.archived!==undefined){const changedAt=args.archived?new Date():null;values.archivedAt=changedAt;if(args.read===undefined)values.readAt=changedAt;}await db.update(schema.articles).set(values).where(eq(schema.articles.id,args.id));ctx.invalidateQueries();return{ok:true};});}}),
 
   deleteArticle: defineAction({
     description: "Deletes one article along with its note and highlights and prevents its return on refresh.", request:z.object({id:z.number().int()}),
     response:z.object({ok:z.boolean(),deleted:z.boolean()}),
     async handler(ctx,args){
       const db=ctx.db<typeof schema>();
-      const [article]=await db.select({id:schema.articles.id,feedId:schema.articles.feedId,guid:schema.articles.guid,imageBlobKey:schema.articles.imageBlobKey}).from(schema.articles).where(eq(schema.articles.id,args.id)).limit(1);
+      const [article]=await db.select({id:schema.articles.id,feedId:schema.articles.feedId,guid:schema.articles.guid,imageBlobKey:schema.articles.imageBlobKey,thumbnailBlobKey:schema.articles.thumbnailBlobKey}).from(schema.articles).where(eq(schema.articles.id,args.id)).limit(1);
       if(!article)return{ok:true,deleted:false};
       await db.insert(schema.articleTombstones).values({feedId:article.feedId,guid:article.guid}).onConflictDoNothing();
       await db.delete(schema.highlights).where(eq(schema.highlights.articleId,article.id));
@@ -1092,6 +1335,7 @@ export const Actions = {
       await deletePhotosForArticles(ctx,[article.id]);
       await db.delete(schema.articles).where(eq(schema.articles.id,article.id));
       if(article.imageBlobKey)await ctx.blobs.delete(article.imageBlobKey);
+      await deleteThumbnailBlob(ctx,article.imageBlobKey,article.thumbnailBlobKey);
       ctx.invalidateQueries();
       return{ok:true,deleted:true};
     }
@@ -1108,6 +1352,7 @@ export const Actions = {
   addFeed: defineAction({
     description: "Validates and adds a new RSS or Atom feed subscription to a category.", request:z.object({url:z.string().min(1).max(2000),title:z.string().max(200).optional(),theme_id:z.number().int()}),
     response:z.object({ok:z.boolean(),id:z.number().nullable(),title:z.string().nullable(),added_count:z.number(),error:z.string().nullable()}),
+    privileged:[privileged.resizeThumbnail],
     async handler(ctx,args){
       const db=ctx.db<typeof schema>();
       let url:URL;
@@ -1130,12 +1375,12 @@ export const Actions = {
         let addedCount=0;
         const imageCandidates:Array<{articleId:number;url:string;alt:string}>=[];
         for(const item of items){
-          const inserted=await db.insert(schema.articles).values({feedId:feed.id,guid:item.guid,url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,publishedAt:item.published}).onConflictDoNothing().returning({id:schema.articles.id});
+          const inserted=await db.insert(schema.articles).values({feedId:feed.id,guid:item.guid,url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,wordCount:bodyWordCount(item.body),publishedAt:item.published}).onConflictDoNothing().returning({id:schema.articles.id});
           addedCount+=inserted.length;
           const created=inserted[0];
           if(created&&item.imageUrl)imageCandidates.push({articleId:created.id,url:item.imageUrl,alt:item.imageAlt??item.title});
         }
-        await concurrentMap(imageCandidates,async candidate=>{const key=await ownArticleImage(ctx,candidate.articleId,candidate.url);if(key)await db.update(schema.articles).set({imageBlobKey:key,imageAlt:candidate.alt}).where(eq(schema.articles.id,candidate.articleId));return key;},6);
+        await concurrentMap(imageCandidates,async candidate=>{const owned=await ownArticleImage(ctx,candidate.articleId,candidate.url);if(owned)await db.update(schema.articles).set({imageBlobKey:owned.key,thumbnailBlobKey:owned.thumbKey,imageAlt:candidate.alt}).where(eq(schema.articles.id,candidate.articleId));return owned;},6);
         ctx.invalidateQueries();
         return {ok:true,id:feed.id,title,added_count:addedCount,error:null};
       } catch(e) { return {ok:false,id:null,title:null,added_count:0,error:safeError(e)}; }
@@ -1175,7 +1420,7 @@ export const Actions = {
       return { ok: true };
     },
   }),
-  deleteFeed: defineAction({description: "Deletes a feed subscription and all of its saved articles and annotations.", request:z.object({id:z.number().int()}),response:z.object({ok:z.boolean()}),async handler(ctx,args){const db=ctx.db<typeof schema>();const articleRows=await db.select({id:schema.articles.id,imageBlobKey:schema.articles.imageBlobKey}).from(schema.articles).where(eq(schema.articles.feedId,args.id));const articleIds=articleRows.map(row=>row.id);if(articleIds.length){await db.delete(schema.highlights).where(inArray(schema.highlights.articleId,articleIds));await db.delete(schema.notes).where(inArray(schema.notes.articleId,articleIds));await deletePhotosForArticles(ctx,articleIds);await db.delete(schema.articles).where(eq(schema.articles.feedId,args.id));for(const row of articleRows){if(row.imageBlobKey)await ctx.blobs.delete(row.imageBlobKey);}}await db.delete(schema.articleTombstones).where(eq(schema.articleTombstones.feedId,args.id));await db.delete(schema.feeds).where(eq(schema.feeds.id,args.id));ctx.invalidateQueries();return{ok:true};}}),
+  deleteFeed: defineAction({description: "Deletes a feed subscription and all of its saved articles and annotations.", request:z.object({id:z.number().int()}),response:z.object({ok:z.boolean()}),async handler(ctx,args){const db=ctx.db<typeof schema>();const articleRows=await db.select({id:schema.articles.id,imageBlobKey:schema.articles.imageBlobKey,thumbnailBlobKey:schema.articles.thumbnailBlobKey}).from(schema.articles).where(eq(schema.articles.feedId,args.id));const articleIds=articleRows.map(row=>row.id);if(articleIds.length){await db.delete(schema.highlights).where(inArray(schema.highlights.articleId,articleIds));await db.delete(schema.notes).where(inArray(schema.notes.articleId,articleIds));await deletePhotosForArticles(ctx,articleIds);await db.delete(schema.articles).where(eq(schema.articles.feedId,args.id));for(const row of articleRows){if(row.imageBlobKey)await ctx.blobs.delete(row.imageBlobKey);await deleteThumbnailBlob(ctx,row.imageBlobKey,row.thumbnailBlobKey);}}await db.delete(schema.articleTombstones).where(eq(schema.articleTombstones.feedId,args.id));await db.delete(schema.feeds).where(eq(schema.feeds.id,args.id));ctx.invalidateQueries();return{ok:true};}}),
   setArchiveDays: defineAction({description: "Sets how many days read articles stay before auto-archiving.", request:z.object({days:z.number().int().min(1).max(365)}),response:z.object({ok:z.boolean()}),async handler(ctx,args){await ctx.db<typeof schema>().insert(schema.settings).values({id:1,archiveDays:args.days}).onConflictDoUpdate({target:schema.settings.id,set:{archiveDays:args.days}});await autoArchive(ctx);ctx.invalidateQueries();return{ok:true};}}),
   setRetentionDays: defineAction({description: "Sets the retention window and deletes expired unprotected articles.", request:z.object({days:z.number().int().min(1).max(365)}),response:z.object({ok:z.boolean(),deleted:z.number()}),async handler(ctx,args){await ctx.db<typeof schema>().insert(schema.settings).values({id:1,retentionDays:args.days}).onConflictDoUpdate({target:schema.settings.id,set:{retentionDays:args.days}});const deleted=await deleteExpiredArticles(ctx);ctx.invalidateQueries();return{ok:true,deleted};}}),
 
@@ -1452,6 +1697,152 @@ export const Actions = {
       }
       ctx.invalidateQueries();
       return { saved };
+    },
+  }),
+
+
+  log_perf: defineAction({
+    description: "Records client-measured performance samples (tap-to-visual, article-open render, inbox first paint) into the perf log, fire-and-forget from the client.",
+    request: z.object({ events: z.array(z.object({ metric: z.string().min(1).max(80), duration_ms: z.number().min(0).max(600000), bytes: z.number().int().min(0).max(100000000).optional(), phase: z.string().max(40).optional() })).min(1).max(50) }),
+    response: z.object({ ok: z.boolean(), recorded: z.number() }),
+    async handler(ctx, args) {
+      const phase = await getPerfPhase(ctx);
+      let recorded = 0;
+      for (const e of args.events) {
+        await recordPerf(ctx, e.metric, e.duration_ms, e.bytes ?? null, e.phase ?? phase);
+        recorded += 1;
+      }
+      return { ok: true, recorded };
+    },
+  }),
+
+  get_perf_report: defineAction({
+    description: "Returns per-metric performance aggregates (count, p50 and p95 for duration and payload bytes), optionally filtered to one phase label, plus the current phase.",
+    request: z.object({ phase: z.string().max(40).optional() }),
+    response: z.object({
+      phase: z.string().nullable(),
+      current_phase: z.string(),
+      metrics: z.array(z.object({ metric: z.string(), count: z.number(), duration_p50: z.number(), duration_p95: z.number(), bytes_p50: z.number(), bytes_p95: z.number() })),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const current = await getPerfPhase(ctx);
+      const rows = args.phase
+        ? await db.select().from(schema.perfEvents).where(eq(schema.perfEvents.phase, args.phase))
+        : await db.select().from(schema.perfEvents);
+      const byMetric = new Map<string, { durations: number[]; bytes: number[] }>();
+      for (const r of rows) {
+        const entry = byMetric.get(r.metric) ?? { durations: [], bytes: [] };
+        entry.durations.push(r.durationMs);
+        if (r.bytes !== null && r.bytes !== undefined) entry.bytes.push(r.bytes);
+        byMetric.set(r.metric, entry);
+      }
+      const metrics = [...byMetric.entries()].map(([metric, v]) => {
+        const d = [...v.durations].sort((a, b) => a - b);
+        const b = [...v.bytes].sort((a, b) => a - b);
+        return { metric, count: v.durations.length, duration_p50: perfPercentile(d, 50), duration_p95: perfPercentile(d, 95), bytes_p50: perfPercentile(b, 50), bytes_p95: perfPercentile(b, 95) };
+      }).sort((a, b) => a.metric.localeCompare(b.metric));
+      return { phase: args.phase ?? null, current_phase: current, metrics };
+    },
+  }),
+
+  set_perf_phase: defineAction({
+    description: "Sets the current performance phase label (e.g. baseline, phase1) that new perf samples are tagged with.",
+    request: z.object({ phase: z.string().min(1).max(40) }),
+    response: z.object({ ok: z.boolean(), phase: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const phase = args.phase.trim();
+      await db.insert(schema.settings).values({ id: 1, perfPhase: phase }).onConflictDoUpdate({ target: schema.settings.id, set: { perfPhase: phase } });
+      return { ok: true, phase };
+    },
+  }),
+
+  get_perf_phase: defineAction({
+    description: "Returns the current performance phase label that new perf samples are tagged with.",
+    request: z.object({}),
+    response: z.object({ phase: z.string() }),
+    async handler(ctx) { return { phase: await getPerfPhase(ctx) }; },
+  }),
+
+  backfill_thumbnails: defineAction({
+    description: "Generates pending Phase 5 list thumbnails for stored article images and pulled photos that do not have one yet, up to the requested limit, and reports how many succeeded or failed.",
+    request: z.object({ limit: z.number().int().min(1).max(50).default(20) }),
+    response: z.object({ processed: z.number(), succeeded: z.number(), failed: z.number(), remaining: z.number() }),
+    privileged: [privileged.resizeThumbnail],
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      let processed = 0; let succeeded = 0; let failed = 0;
+      const articleRows = await db.select({ id: schema.articles.id, imageBlobKey: schema.articles.imageBlobKey }).from(schema.articles).where(and(isNotNull(schema.articles.imageBlobKey), isNull(schema.articles.thumbnailBlobKey))).limit(args.limit);
+      for (const row of articleRows) {
+        if (!row.imageBlobKey) continue;
+        processed += 1;
+        const thumbKey = await ensureThumbnailForKey(ctx, row.imageBlobKey);
+        if (thumbKey) { succeeded += 1; await db.update(schema.articles).set({ thumbnailBlobKey: thumbKey }).where(eq(schema.articles.id, row.id)); }
+        else failed += 1;
+      }
+      {
+        // Photos get their own small slice of every call so a large
+        // article backlog cannot starve them (they are few and include
+        // the lead images readers actually see in lists).
+        const photoRows = await db.select({ id: schema.articlePhotos.id, blobKey: schema.articlePhotos.blobKey }).from(schema.articlePhotos).where(isNull(schema.articlePhotos.thumbnailBlobKey)).limit(Math.min(10, args.limit));
+        for (const row of photoRows) {
+          processed += 1;
+          const thumbKey = await ensureThumbnailForKey(ctx, row.blobKey);
+          if (thumbKey) {
+            succeeded += 1;
+            await db.update(schema.articlePhotos).set({ thumbnailBlobKey: thumbKey }).where(eq(schema.articlePhotos.id, row.id));
+            // Keep the article's lead thumbnail in sync when this photo
+            // is the article's list image.
+            await db.update(schema.articles).set({ thumbnailBlobKey: thumbKey }).where(and(eq(schema.articles.imageBlobKey, row.blobKey), isNull(schema.articles.thumbnailBlobKey)));
+          } else failed += 1;
+        }
+      }
+      const [remainingArticles] = await db.select({ n: sql<number>`count(*)` }).from(schema.articles).where(and(isNotNull(schema.articles.imageBlobKey), isNull(schema.articles.thumbnailBlobKey)));
+      const [remainingPhotos] = await db.select({ n: sql<number>`count(*)` }).from(schema.articlePhotos).where(isNull(schema.articlePhotos.thumbnailBlobKey));
+      return { processed, succeeded, failed, remaining: Number(remainingArticles?.n ?? 0) + Number(remainingPhotos?.n ?? 0) };
+    },
+  }),
+
+  get_thumbnail_report: defineAction({
+    description: "Returns a Phase 5 byte comparison for stored article images and pulled photos: original versus thumbnail blob sizes for a sample, plus aggregate totals and coverage counts.",
+    request: z.object({ sample: z.number().int().min(1).max(100).default(50) }),
+    response: z.object({
+      articles_with_image: z.number(), articles_with_thumbnail: z.number(),
+      photos: z.number(), photos_with_thumbnail: z.number(),
+      sample: z.array(z.object({ kind: z.string(), id: z.number(), original_bytes: z.number(), thumbnail_bytes: z.number(), same_key: z.boolean() })),
+      sample_original_bytes: z.number(), sample_thumbnail_bytes: z.number(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const [articleTotals] = await db.select({ total: sql<number>`count(*)`, withThumb: sql<number>`sum(case when ${schema.articles.thumbnailBlobKey} is not null then 1 else 0 end)` }).from(schema.articles).where(isNotNull(schema.articles.imageBlobKey));
+      const [photoTotals] = await db.select({ total: sql<number>`count(*)`, withThumb: sql<number>`sum(case when ${schema.articlePhotos.thumbnailBlobKey} is not null then 1 else 0 end)` }).from(schema.articlePhotos);
+      // Sample from rows that HAVE thumbnails (newest first): those are
+      // the rows with a real byte comparison to report.
+      const articleRows = await db.select({ id: schema.articles.id, imageBlobKey: schema.articles.imageBlobKey, thumbnailBlobKey: schema.articles.thumbnailBlobKey }).from(schema.articles).where(and(isNotNull(schema.articles.imageBlobKey), isNotNull(schema.articles.thumbnailBlobKey))).orderBy(desc(schema.articles.id)).limit(args.sample);
+      const photoRows = await db.select({ id: schema.articlePhotos.id, blobKey: schema.articlePhotos.blobKey, thumbnailBlobKey: schema.articlePhotos.thumbnailBlobKey }).from(schema.articlePhotos).where(isNotNull(schema.articlePhotos.thumbnailBlobKey)).orderBy(desc(schema.articlePhotos.id)).limit(args.sample);
+      const sizeOf = async (key: string | null): Promise<number> => {
+        if (!key) return 0;
+        try { const head = await ctx.blobs.head(key); return head?.sizeBytes ?? 0; } catch { return 0; }
+      };
+      const sample: Array<{ kind: string; id: number; original_bytes: number; thumbnail_bytes: number; same_key: boolean }> = [];
+      const pushSample = async (kind: string, id: number, originalKey: string | null, thumbKey: string | null) => {
+        if (sample.length >= args.sample || !originalKey || !thumbKey) return;
+        const originalBytes = await sizeOf(originalKey);
+        const thumbBytes = thumbKey === originalKey ? originalBytes : await sizeOf(thumbKey);
+        if (originalBytes > 0) sample.push({ kind, id, original_bytes: originalBytes, thumbnail_bytes: thumbBytes, same_key: thumbKey === originalKey });
+      };
+      for (const r of articleRows) await pushSample("article", r.id, r.imageBlobKey, r.thumbnailBlobKey);
+      for (const r of photoRows) await pushSample("photo", r.id, r.blobKey, r.thumbnailBlobKey);
+      return {
+        articles_with_image: Number(articleTotals?.total ?? 0),
+        articles_with_thumbnail: Number(articleTotals?.withThumb ?? 0),
+        photos: Number(photoTotals?.total ?? 0),
+        photos_with_thumbnail: Number(photoTotals?.withThumb ?? 0),
+        sample,
+        sample_original_bytes: sample.reduce((n, s) => n + s.original_bytes, 0),
+        sample_thumbnail_bytes: sample.reduce((n, s) => n + s.thumbnail_bytes, 0),
+      };
     },
   }),
 

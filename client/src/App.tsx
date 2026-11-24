@@ -1,14 +1,132 @@
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ApiResponse } from "./api";
+import { markExplicitArticle, markPrefetchedArticle, wasRestored } from "./cachePersist";
+import { enqueueOfflineState, getOfflineQueue, isNetworkError, removeOfflineEntries, removeOfflineEntry, removeOfflineFields, subscribeOfflineQueue } from "./offlineQueue";
 import { SpeedReader, htmlToPlainText } from "./SpeedReader";
 import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
 import type { Actions } from "../../server/src/actions";
 
 const FIELDS = actionFields<typeof Actions>();
+// --- Client performance instrumentation (Phase 0) -------------------------
+// Fire-and-forget, batched samples sent to the server perf log via log_perf.
+// Instrumentation never blocks or slows the interaction it measures: samples
+// queue in memory and flush in the background (10 samples or 2s, whichever
+// comes first); a failed flush is dropped silently.
+type PerfEventInput = { metric: string; duration_ms: number; bytes?: number };
+let perfQueue: PerfEventInput[] = [];
+let perfFlushTimer: number | undefined;
+function flushPerfQueue() {
+  if (!perfQueue.length) return;
+  const batch = perfQueue.splice(0, perfQueue.length);
+  if (perfFlushTimer !== undefined) { window.clearTimeout(perfFlushTimer); perfFlushTimer = undefined; }
+  void api.log_perf({ events: batch }).catch(() => { /* dropped by design */ });
+}
+function queuePerf(metric: string, durationMs: number, bytes?: number) {
+  try {
+    perfQueue.push({ metric, duration_ms: Math.max(0, Math.round(durationMs)), bytes });
+    if (perfQueue.length >= 10) flushPerfQueue();
+    else if (perfFlushTimer === undefined) perfFlushTimer = window.setTimeout(flushPerfQueue, 2000);
+  } catch { /* instrumentation must never break the UI */ }
+}
+function measureVisualUpdate(metric: string, start: number) {
+  try {
+    requestAnimationFrame(() => requestAnimationFrame(() => queuePerf(metric, performance.now() - start)));
+  } catch { queuePerf(metric, performance.now() - start); }
+}
+
+// --- Background prefetching (Phase 3) --------------------------------------
+// Prefetches run only in idle time (requestIdleCallback where the platform
+// offers it, a plain timer otherwise), one at a time, and only for work
+// the caller has already confirmed is not competing with a load the user
+// is waiting on. The returned cancel function stops any not-yet-started
+// steps; a fetch already in flight simply lands in the cache.
+function scheduleIdle(task: () => void): () => void {
+  const w = window as unknown as { requestIdleCallback?: (cb: () => void, options?: { timeout: number }) => number; cancelIdleCallback?: (handle: number) => void };
+  if (typeof w.requestIdleCallback === "function") {
+    const handle = w.requestIdleCallback(task, { timeout: 2500 });
+    return () => { w.cancelIdleCallback?.(handle); };
+  }
+  const handle = window.setTimeout(task, 400);
+  return () => window.clearTimeout(handle);
+}
+
 
 type Dashboard = ApiResponse<typeof api, "dashboard">;
 type Article = Dashboard["articles"][number];
+type ArticleData = ApiResponse<typeof api, "getArticle">;
+type ArticleStateArgs = { id: number; read?: boolean; starred?: boolean; archived?: boolean };
+// Mirror of the server's setArticleState field semantics (marking read also
+// archives; archiving also marks read; undoing either clears both), applied
+// to a cached article so star / read / archive reflect the tap instantly
+// instead of waiting for the dashboard refetch round trip before the UI
+// shows anything. (List payloads are slim since Phase 1: no article bodies,
+// truncated excerpts; the body loads via getArticle on open.)
+function patchArticleState<T extends { starred: boolean; read_at: string | null; archived_at: string | null }>(a: T, args: ArticleStateArgs): T {
+  let next = a;
+  const now = new Date().toISOString();
+  if (args.read !== undefined) { const ts = args.read ? now : null; next = { ...next, read_at: ts, archived_at: ts }; }
+  if (args.starred !== undefined) next = { ...next, starred: args.starred };
+  if (args.archived !== undefined) { const ts = args.archived ? now : null; next = { ...next, archived_at: ts }; if (args.read === undefined) next = { ...next, read_at: ts }; }
+  return next;
+}
+// Applies a state change to one cached dashboard payload: the article is
+// patched in place, or dropped from the list when the change takes it out
+// of that view (mirroring the server's per-view filters: Starred keeps only
+// starred, Archive only archived, Feed drops archived, the inbox views drop
+// read or archived), and the feed / theme unread counts move with it.
+function patchDashboardData(data: Dashboard, viewKey: unknown, args: ArticleStateArgs): Dashboard {
+  const existing = data.articles.find(a => a.id === args.id);
+  if (!existing) return data;
+  const patched = patchArticleState(existing, args);
+  const keep = viewKey === "Starred" ? patched.starred : viewKey === "Archive" ? patched.archived_at !== null : viewKey === "Feed" ? patched.archived_at === null : patched.read_at === null && patched.archived_at === null;
+  const articles = keep ? data.articles.map(a => a.id === args.id ? patched : a) : data.articles.filter(a => a.id !== args.id);
+  const wasCounted = existing.read_at === null && existing.archived_at === null;
+  const isCounted = patched.read_at === null && patched.archived_at === null;
+  const delta = (isCounted ? 1 : 0) - (wasCounted ? 1 : 0);
+  const feeds = delta === 0 ? data.feeds : data.feeds.map(f => f.id === existing.feed_id ? { ...f, unread: Math.max(0, f.unread + delta) } : f);
+  const themes = delta === 0 ? data.themes : data.themes.map(t => t.name === existing.theme ? { ...t, unread: Math.max(0, t.unread + delta) } : t);
+  return { ...data, articles, feeds, themes };
+}
+// Board columns only ever hold unread, unarchived articles, so a read or
+// archive change removes the card and drops the column's unread count.
+function patchBoardData(data: BoardData, args: ArticleStateArgs): BoardData {
+  let changed = false;
+  const columns = data.columns.map(col => {
+    const existing = col.articles.find(a => a.id === args.id);
+    if (!existing) return col;
+    changed = true;
+    const patched = patchArticleState(existing, args);
+    const stays = patched.read_at === null && patched.archived_at === null;
+    return { ...col, unread: stays ? col.unread : Math.max(0, col.unread - 1), articles: stays ? col.articles.map(a => a.id === args.id ? patched : a) : col.articles.filter(a => a.id !== args.id) };
+  });
+  return changed ? { ...data, columns } : data;
+}
+// Same optimistic treatment for Brief story feedback: star / dismiss /
+// downvote flip in the cached edition immediately instead of after the
+// get_brief refetch.
+function patchBriefData(data: BriefData, args: { editionId: number; storyKey: string; type: BriefFeedbackType }): BriefData {
+  let changed = false;
+  const editions = data.editions.map(ed => {
+    if (ed.id !== args.editionId) return ed;
+    let editionChanged = false;
+    const stories = ed.stories.map(s => {
+      if (s.key !== args.storyKey) return s;
+      editionChanged = true;
+      switch (args.type) {
+        case "star": return { ...s, starred: true, stars: s.stars + 1 };
+        case "unstar": return { ...s, starred: false, stars: Math.max(0, s.stars - 1) };
+        case "dismiss": return { ...s, dismissed: true };
+        case "downvote": return { ...s, downvoted: true, downvotes: s.downvotes + 1 };
+        case "undownvote": return { ...s, downvoted: false, downvotes: Math.max(0, s.downvotes - 1) };
+        default: return s;
+      }
+    });
+    if (editionChanged) changed = true;
+    return editionChanged ? { ...ed, stories } : ed;
+  });
+  return changed ? { ...data, editions } : data;
+}
 type View = "Main" | "Board" | "Brief" | "Theme" | "Feed" | "Library" | "Organize" | "Settings";
 
 // Keep the briefing implementation available without exposing the experience.
@@ -327,13 +445,23 @@ export function App(){
   // each currently own a pushed history entry.
   const dossierLayerPushed=useRef(false); const articleLayerPushed=useRef(false);
   const mutationError=()=>setNotice("That change could not be saved. Please try again.");
+  // Phase 0 client timing refs: app mount time for inbox first paint, and
+  // the tap time for the currently opening article.
+  const appMountRef=useRef(performance.now());
+  const inboxPaintRecordedRef=useRef(false);
+  const articleOpenStartRef=useRef<number|null>(null);
   // Search queries run on a debounced copy of the input: the dashboard,
   // board, and library actions each scan article bodies, so firing one per
   // keystroke wasted a full scan per character typed.
   useEffect(()=>{const t=window.setTimeout(()=>setDebouncedSearch(search),250);return()=>window.clearTimeout(t);},[search]);
   useEffect(()=>{setListLimit(120)},[view,theme,feedId,debouncedSearch]);
-  const dash=useQuery({queryKey:["dashboard",view,theme,feedId,debouncedSearch,listLimit],queryFn:()=>api.dashboard({view:view==="Library"||view==="Organize"||view==="Settings"||view==="Brief"||view==="Board"?"Main":view,theme,feed_id:feedId,search:debouncedSearch,limit:listLimit})});
-  const board=useQuery({queryKey:["board",debouncedSearch],queryFn:()=>api.board({search:debouncedSearch,per_theme:12}),enabled:view==="Board"});
+  // Phase 2 stale-while-revalidate: the persisted queries (dashboard,
+  // board, article) are staleTime 0, so cached data (in-memory or hydrated
+  // from the persisted snapshot) renders immediately on every mount and a
+  // background revalidation updates it in place; gcTime keeps articles in
+  // memory well past the SDK default so reopening one stays instant.
+  const dash=useQuery({queryKey:["dashboard",view,theme,feedId,debouncedSearch,listLimit],queryFn:()=>api.dashboard({view:view==="Library"||view==="Organize"||view==="Settings"||view==="Brief"||view==="Board"?"Main":view,theme,feed_id:feedId,search:debouncedSearch,limit:listLimit}),staleTime:0,gcTime:10*60_000});
+  const board=useQuery({queryKey:["board",debouncedSearch],queryFn:()=>api.board({search:debouncedSearch,per_theme:12}),enabled:view==="Board",staleTime:0,gcTime:10*60_000});
   const brief=useQuery({queryKey:["brief"],queryFn:()=>api.get_brief({}),enabled:view==="Brief"});
   // Brief P1 initial load: light dossier summaries + marks + editions only.
   // Full dossier objects load lazily through get_dossier (detail overlay,
@@ -371,25 +499,167 @@ export function App(){
   const detailQuery=useQuery({queryKey:["dossier",selectedDossierId],queryFn:()=>api.get_dossier({id:selectedDossierId??""}),enabled:selectedDossierId!==undefined});
   const selectedDossier=detailQuery.data?.dossier??undefined;
   const library=useQuery({queryKey:["library",debouncedSearch],queryFn:()=>api.library({search:debouncedSearch}),enabled:view==="Library"});
-  const starredDash=useQuery({queryKey:["dashboard","Starred","library",debouncedSearch],queryFn:()=>api.dashboard({view:"Starred",search:debouncedSearch,limit:120}),enabled:view==="Library"});
-  const archivedDash=useQuery({queryKey:["dashboard","Archive","library",debouncedSearch],queryFn:()=>api.dashboard({view:"Archive",search:debouncedSearch,limit:120}),enabled:view==="Library"&&archiveOpen});
-  const article=useQuery({queryKey:["article",selectedId],queryFn:()=>api.getArticle({id:selectedId ?? 0}),enabled:selectedId!==undefined});
+  const starredDash=useQuery({queryKey:["dashboard","Starred","library",debouncedSearch],queryFn:()=>api.dashboard({view:"Starred",search:debouncedSearch,limit:120}),enabled:view==="Library",staleTime:0,gcTime:10*60_000});
+  const archivedDash=useQuery({queryKey:["dashboard","Archive","library",debouncedSearch],queryFn:()=>api.dashboard({view:"Archive",search:debouncedSearch,limit:120}),enabled:view==="Library"&&archiveOpen,staleTime:0,gcTime:10*60_000});
+  const article=useQuery({queryKey:["article",selectedId],queryFn:()=>api.getArticle({id:selectedId ?? 0}),enabled:selectedId!==undefined,staleTime:0,gcTime:30*60_000});
+  // Phase 2 measurement: split the first-paint and article-open timings
+  // into cache-warm (data already in the query cache at tap/mount, from
+  // this session or the persisted snapshot) and cold (waited on the
+  // network), alongside the original combined metrics.
+  const articleOpenCacheRef=useRef<{warm:boolean;restored:boolean}|null>(null);
+  useEffect(()=>{if(selectedId!==undefined){markExplicitArticle(selectedId);articleOpenStartRef.current=performance.now();articleOpenCacheRef.current={warm:qc.getQueryData(["article",selectedId])!==undefined,restored:wasRestored(["article",selectedId])};}},[selectedId,qc]);
+  useEffect(()=>{if(!inboxPaintRecordedRef.current&&dash.data&&!dash.isPending){inboxPaintRecordedRef.current=true;const elapsed=performance.now()-appMountRef.current;queuePerf("client_inbox_first_paint",elapsed);const dashKey=["dashboard",view,theme,feedId,debouncedSearch,listLimit] as const;queuePerf(wasRestored(dashKey)?"client_inbox_first_paint_warm":"client_inbox_first_paint_cold",elapsed);}},[dash.data,dash.isPending,view,theme,feedId,debouncedSearch,listLimit]);
+  useEffect(()=>{if(selectedId!==undefined&&article.data&&!article.isPending&&articleOpenStartRef.current!==null){const elapsed=performance.now()-articleOpenStartRef.current;queuePerf("client_article_open_render",elapsed);const cache=articleOpenCacheRef.current;if(cache)queuePerf(cache.warm?"client_article_open_warm":"client_article_open_cold",elapsed);if(cache?.restored)queuePerf("client_article_open_restored",elapsed);articleOpenStartRef.current=null;articleOpenCacheRef.current=null;}},[selectedId,article.data,article.isPending]);
+  // --- Offline action queue (Phase 4) ------------------------------------
+  // Pending article-state changes taken offline. The queue lives in
+  // localStorage (offlineQueue.ts), coalesced to the latest desired state
+  // per article, and this component mirrors it reactively so the pending
+  // indicator and the revalidation guard below stay current.
+  const pendingQueue=useSyncExternalStore(subscribeOfflineQueue,getOfflineQueue,getOfflineQueue);
+  const flushingRef=useRef(false);
+  const flushAttemptsRef=useRef<Map<number,number>>(new Map());
+  const flushRef=useRef<(()=>Promise<void>)|null>(null);
+  const MAX_FLUSH_ATTEMPTS_PER_SESSION=5;
+  const flushOfflineQueue=async():Promise<void>=>{
+    if(flushingRef.current)return;
+    if(typeof navigator!=="undefined"&&navigator.onLine===false)return;
+    const entries=[...getOfflineQueue()].sort((a,b)=>a.updatedAt-b.updatedAt);
+    if(!entries.length)return;
+    flushingRef.current=true;
+    try{
+      let drainedAny=false;
+      for(const entry of entries){
+        const attempts=flushAttemptsRef.current.get(entry.id)??0;
+        if(attempts>=MAX_FLUSH_ATTEMPTS_PER_SESSION)continue;
+        flushAttemptsRef.current.set(entry.id,attempts+1);
+        try{
+          await api.setArticleState({id:entry.id,...(entry.starred!==undefined?{starred:entry.starred}:{}),...(entry.archived!==undefined?{archived:entry.archived}:{}),...(entry.read!==undefined?{read:entry.read}:{})});
+          removeOfflineEntry(entry.id);
+          flushAttemptsRef.current.delete(entry.id);
+          drainedAny=true;
+        }catch(err){
+          if(isNetworkError(err)){
+            // Still unreachable: keep this and every later entry queued
+            // for the next opportunity (online event / next app open);
+            // the per-session cap above stops any hot loop.
+            break;
+          }
+          // The server answered and refused: not an offline case. Drop
+          // the entry, surface it through the normal notice, and
+          // reconcile this article to the server's state.
+          removeOfflineEntry(entry.id);
+          flushAttemptsRef.current.delete(entry.id);
+          setNotice("A change made offline couldn't be saved and was reverted.");
+          void qc.invalidateQueries({queryKey:["dashboard"]});
+          void qc.invalidateQueries({queryKey:["board"]});
+          void qc.invalidateQueries({queryKey:["article",entry.id]});
+        }
+      }
+      if(drainedAny&&getOfflineQueue().length===0){void qc.invalidateQueries({queryKey:["dashboard"]});void qc.invalidateQueries({queryKey:["board"]});}
+    }finally{flushingRef.current=false;}
+  };
+  flushRef.current=flushOfflineQueue;
+  // Replay on app open and whenever connectivity returns.
+  useEffect(()=>{void flushRef.current?.();},[]);
+  useEffect(()=>{const onOnline=()=>{void flushRef.current?.();};window.addEventListener("online",onOnline);return()=>window.removeEventListener("online",onOnline);},[]);
+  // Verification hook: lets the audit probe inspect and flush the queue
+  // (the probe cannot toggle the sandbox browser's connectivity itself).
+  useEffect(()=>{const w=window as unknown as {__newsOfflineQueue?:unknown};w.__newsOfflineQueue={getQueue:()=>getOfflineQueue(),flush:()=>flushRef.current?.()};return()=>{delete w.__newsOfflineQueue;};},[]);
+  // Pending queued state wins over background revalidation: when a
+  // refetch lands server state that predates an offline change, re-apply
+  // the queued desired state on top so a revalidation can never un-star
+  // or un-archive something the user changed offline.
+  useEffect(()=>{
+    if(!pendingQueue.length)return;
+    for(const [key,data] of qc.getQueriesData<Dashboard>({queryKey:["dashboard"]})){
+      if(!data)continue;
+      const needs=data.articles.some(a=>{const q=pendingQueue.find(e=>e.id===a.id);if(!q)return false;return (q.starred!==undefined&&a.starred!==q.starred)||(q.archived!==undefined&&(a.archived_at!==null)!==q.archived)||(q.read!==undefined&&(a.read_at!==null)!==q.read);});
+      if(!needs)continue;
+      let patched=data;
+      for(const entry of pendingQueue)patched=patchDashboardData(patched,key[1],entry);
+      qc.setQueryData(key,patched);
+    }
+    for(const [key,data] of qc.getQueriesData<BoardData>({queryKey:["board"]})){
+      if(!data)continue;
+      const all=data.columns.flatMap(c=>c.articles);
+      const needs=all.some(a=>{const q=pendingQueue.find(e=>e.id===a.id);if(!q)return false;return (q.starred!==undefined&&a.starred!==q.starred)||(q.archived!==undefined&&(a.archived_at!==null)!==q.archived)||(q.read!==undefined&&(a.read_at!==null)!==q.read);});
+      if(!needs)continue;
+      let patched=data;
+      for(const entry of pendingQueue)patched=patchBoardData(patched,entry);
+      qc.setQueryData(key,patched);
+    }
+    for(const entry of pendingQueue){
+      const data=qc.getQueryData<ArticleData>(["article",entry.id]);
+      if(!data)continue;
+      const a=data.article;
+      const needs=(entry.starred!==undefined&&a.starred!==entry.starred)||(entry.archived!==undefined&&(a.archived_at!==null)!==entry.archived)||(entry.read!==undefined&&(a.read_at!==null)!==entry.read);
+      if(needs)qc.setQueryData(["article",entry.id],{...data,article:patchArticleState(a,entry)});
+    }
+  },[pendingQueue,dash.data,board.data,starredDash.data,archivedDash.data,article.data,qc]);
   const refresh=useMutation({mutationFn:()=>api.refresh_feeds({}),onSuccess:r=>{setNotice(`${r.new_count} new · ${r.error_count} feed errors`);void qc.invalidateQueries();},onError:mutationError});
-  const state=useMutation({mutationFn:(args:{id:number;read?:boolean;starred?:boolean;archived?:boolean})=>api.setArticleState(args),onSuccess:(_result,args)=>{if(args.read===false)setOpenedIds(ids=>ids.filter(id=>id!==args.id));void qc.invalidateQueries({queryKey:["dashboard"]});if(args.starred!==undefined||args.archived===false||args.read===false)void qc.invalidateQueries({queryKey:["article",args.id]});},onError:mutationError});
+  const state=useMutation({mutationFn:(args:ArticleStateArgs)=>api.setArticleState(args),
+    // Optimistic: star / read / archive apply to every cached list (and the
+    // open article) the moment the user taps, so the star fills and an
+    // archived row leaves immediately. The server write still runs; the
+    // onSuccess invalidation reconciles with the refetch, and onError rolls
+    // the caches back to the snapshots taken here.
+    onMutate:async(args)=>{
+      const perfStart = performance.now();
+      const perfMetric = args.starred !== undefined ? "client_star_visual" : args.archived !== undefined ? "client_archive_visual" : null;
+      await Promise.all([qc.cancelQueries({queryKey:["dashboard"]}),qc.cancelQueries({queryKey:["board"]}),qc.cancelQueries({queryKey:["article",args.id]})]);
+      const prevDash=qc.getQueriesData<Dashboard>({queryKey:["dashboard"]});
+      const prevBoard=qc.getQueriesData<BoardData>({queryKey:["board"]});
+      const prevArticle=qc.getQueryData<ArticleData>(["article",args.id]);
+      for(const [key,data] of prevDash){if(data)qc.setQueryData(key,patchDashboardData(data,key[1],args));}
+      for(const [key,data] of prevBoard){if(data)qc.setQueryData(key,patchBoardData(data,args));}
+      if(prevArticle)qc.setQueryData(["article",args.id],{...prevArticle,article:patchArticleState(prevArticle.article,args)});
+      if(perfMetric)measureVisualUpdate(perfMetric,perfStart);
+      return {prevDash,prevBoard,prevArticle,articleId:args.id};
+    },
+    onError:(error,args,context)=>{
+      // Phase 4: a network failure (offline / no answer) is NOT a
+      // rejection. Keep the optimistic change on screen, record the
+      // desired final state in the persistent queue (coalesced per
+      // article), and let the flush replay it when connectivity returns.
+      // Only a genuine server answer-and-refusal rolls back, below.
+      if(isNetworkError(error)){
+        enqueueOfflineState(args);
+        window.setTimeout(()=>{void flushRef.current?.();},6000);
+        return;
+      }
+      if(context){
+        for(const [key,data] of context.prevDash){if(data)qc.setQueryData(key,data);}
+        for(const [key,data] of context.prevBoard){if(data)qc.setQueryData(key,data);}
+        if(context.prevArticle)qc.setQueryData(["article",context.articleId],context.prevArticle);
+      }
+      mutationError();
+    },
+    onSuccess:(_result,args)=>{removeOfflineFields(args.id,(["starred","archived","read"] as const).filter(k=>args[k]!==undefined));if(args.read===false)setOpenedIds(ids=>ids.filter(id=>id!==args.id));void qc.invalidateQueries({queryKey:["dashboard"]});void qc.invalidateQueries({queryKey:["board"]});if(args.starred!==undefined||args.archived===false||args.read===false)void qc.invalidateQueries({queryKey:["article",args.id]});}});
   const finishReading=useMutation({mutationFn:(ids:number[])=>api.finishReading({ids}),onSuccess:()=>{setSelectedId(undefined);setReaderQueue([]);setOpenedIds([]);void qc.invalidateQueries({queryKey:["dashboard"]});},onError:mutationError});
   const markAll=useMutation({mutationFn:()=>api.markAllRead({view:view==="Theme"?"Theme":view==="Feed"?"Feed":"Main",theme,feed_id:feedId}),onSuccess:r=>{setNotice(`${r.updated} marked read`);void qc.invalidateQueries();},onError:mutationError});
   const markThemeRead=useMutation({mutationFn:(themeName:string)=>api.markAllRead({view:"Theme",theme:themeName}),onSuccess:r=>{setNotice(`${r.updated} marked read`);void qc.invalidateQueries();},onError:mutationError});
   const reorderThemes=useMutation({mutationFn:(order:number[])=>api.reorderThemes({order}),onSuccess:()=>{setNotice("Board order saved");void qc.invalidateQueries({queryKey:["board"]});void qc.invalidateQueries({queryKey:["dashboard"]});},onError:mutationError});
   const addFeed=useMutation({mutationFn:(args:{url:string;title?:string;theme_id:number})=>api.addFeed(args),onSuccess:r=>{if(!r.ok){setNotice(r.error??"The feed could not be added.");return;}setNotice(`${r.title??"Feed"} added · ${r.added_count} stories`);void qc.invalidateQueries();},onError:mutationError});
   const updateFeed=useMutation({mutationFn:(args:{id:number;muted?:boolean;keep_forever?:boolean;theme_id?:number})=>api.updateFeed(args),onSuccess:()=>{setNotice("Feed settings saved");void qc.invalidateQueries();},onError:mutationError});
-  const deleteFeed=useMutation({mutationFn:(id:number)=>api.deleteFeed({id}),onSuccess:()=>{setNotice("Feed deleted");void qc.invalidateQueries();},onError:mutationError});
+  const deleteFeed=useMutation({mutationFn:(id:number)=>api.deleteFeed({id}),onSuccess:(_result,feedId)=>{const ids=qc.getQueriesData<Dashboard>({queryKey:["dashboard"]}).flatMap(([,data])=>data?data.articles.filter(a=>a.feed_id===feedId).map(a=>a.id):[]);removeOfflineEntries([...new Set(ids)]);setNotice("Feed deleted");void qc.invalidateQueries();},onError:mutationError});
   const setRetention=useMutation({mutationFn:(days:number)=>api.setRetentionDays({days}),onSuccess:r=>{setNotice(r.deleted?`Retention saved · ${r.deleted} old articles deleted`:"Retention saved");void qc.invalidateQueries();},onError:mutationError});
   const saveNote=useMutation({mutationFn:(args:{article_id:number;text:string})=>api.saveNote(args),onSuccess:()=>{setNotice("Note saved");void qc.invalidateQueries({queryKey:["library"]});void qc.invalidateQueries({queryKey:["article",selectedId]});},onError:mutationError});
   const saveHighlight=useMutation({mutationFn:(args:{article_id:number;text:string})=>api.saveHighlight(args),onSuccess:()=>{setNotice("Highlight saved");void qc.invalidateQueries({queryKey:["article",selectedId]});void qc.invalidateQueries({queryKey:["library"]});},onError:mutationError});
   const deleteHighlight=useMutation({mutationFn:(id:number)=>api.deleteHighlight({id}),onSuccess:()=>{setNotice("Highlight deleted");void qc.invalidateQueries({queryKey:["article",selectedId]});void qc.invalidateQueries({queryKey:["library"]});},onError:mutationError});
-  const deleteArticle=useMutation({mutationFn:(id:number)=>api.deleteArticle({id}),onSuccess:(_result,id)=>{setNotice("Article deleted");setDeleteTarget(undefined);setReaderQueue(items=>items.filter(item=>item.id!==id));if(selectedId===id){const remainingOpened=openedIds.filter(itemId=>itemId!==id);if(remainingOpened.length)finishReading.mutate(remainingOpened);else{setSelectedId(undefined);setOpenedIds([]);}}else setOpenedIds(ids=>ids.filter(itemId=>itemId!==id));void qc.invalidateQueries({queryKey:["dashboard"]});void qc.invalidateQueries({queryKey:["library"]});},onError:mutationError});
+  const deleteArticle=useMutation({mutationFn:(id:number)=>api.deleteArticle({id}),onSuccess:(_result,id)=>{removeOfflineEntry(id);void qc.removeQueries({queryKey:["article",id]});setNotice("Article deleted");setDeleteTarget(undefined);setReaderQueue(items=>items.filter(item=>item.id!==id));if(selectedId===id){const remainingOpened=openedIds.filter(itemId=>itemId!==id);if(remainingOpened.length)finishReading.mutate(remainingOpened);else{setSelectedId(undefined);setOpenedIds([]);}}else setOpenedIds(ids=>ids.filter(itemId=>itemId!==id));void qc.invalidateQueries({queryKey:["dashboard"]});void qc.invalidateQueries({queryKey:["library"]});},onError:mutationError});
   const renameTheme=useMutation({mutationFn:(args:{id:number;name:string})=>api.renameTheme(args),onSuccess:(r,args)=>{if(!r.ok){setNotice(r.error??"The category could not be renamed.");return;}setNotice(`Category renamed to ${r.name??"new name"}`);if(view==="Theme"&&dash.data?.themes.find(item=>item.id===args.id)?.name===theme)setTheme(r.name??undefined);void qc.invalidateQueries();},onError:mutationError});
-  const briefFeedback=useMutation({mutationFn:(args:{editionId:number;storyKey:string;type:BriefFeedbackType;topic?:string;feed?:string})=>api.log_brief_feedback(args),onSuccess:()=>{void qc.invalidateQueries({queryKey:["brief"]});},onError:mutationError});
+  const briefFeedback=useMutation({mutationFn:(args:{editionId:number;storyKey:string;type:BriefFeedbackType;topic?:string;feed?:string})=>api.log_brief_feedback(args),
+    onMutate:async(args)=>{
+      await qc.cancelQueries({queryKey:["brief"]});
+      const prev=qc.getQueriesData<BriefData>({queryKey:["brief"]});
+      for(const [key,data] of prev){if(data)qc.setQueryData(key,patchBriefData(data,args));}
+      return {prev};
+    },
+    onError:(_error,_args,context)=>{
+      if(context)for(const [key,data] of context.prev){if(data)qc.setQueryData(key,data);}
+      mutationError();
+    },
+    onSuccess:()=>{void qc.invalidateQueries({queryKey:["brief"]});}});
   const setMark=useMutation({mutationFn:(args:{dossier_id:string;pinned?:boolean;viewed_at?:string|null})=>api.set_mark(args),onSuccess:()=>{void qc.invalidateQueries({queryKey:["marks"]});},onError:mutationError});
   const recordView=(id:string)=>{setMark.mutate({dossier_id:id,viewed_at:new Date().toISOString()});};
   const invalidateDossiers=()=>{void qc.invalidateQueries({queryKey:["dossiers-summary"]});void qc.invalidateQueries({queryKey:["dossiers-closed"]});void qc.invalidateQueries({queryKey:["dossier"]});};
@@ -460,6 +730,81 @@ export function App(){
   };
   const articles=dash.data?.articles ?? [];
   const readerIndex=selectedId===undefined?-1:readerQueue.findIndex(item=>item.id===selectedId);
+  // --- Prefetching (Phase 3) ------------------------------------------------
+  // Warms the article query cache in the background so the most likely
+  // next open renders from cache (Phase 2's warm path) instead of waiting
+  // on the network: the reader's previous/next neighbours while an article
+  // is open, and the top of the inbox/board once the list has settled.
+  // Prefetches share the Phase 2 persisted budget (20 articles): a
+  // prefetch only starts while a slot is free (the open article's slot is
+  // reserved for it), and cachePersist ranks prefetched articles below
+  // explicitly opened ones when trimming, so a prefetch can never evict
+  // the article being read. Failures are silent by design.
+  const PREFETCH_ARTICLE_BUDGET=20;
+  // onComplete fires only when the queue actually drains (every candidate
+  // fetched, already cached, or stopped by the budget) — never when the
+  // chain is cancelled, so callers can safely treat completion as "done"
+  // and a cancelled chain will be retried by a later effect run.
+  const schedulePrefetches=(ids:number[],onComplete?:()=>void):(()=>void)=>{
+    const cancels:Array<()=>void>=[];
+    let stopped=false;
+    const queue=[...new Set(ids)];
+    const step=()=>{
+      if(stopped)return;
+      while(queue.length){
+        const id=queue.shift() as number;
+        if(id===selectedId)continue;
+        if(qc.getQueryData(["article",id])!==undefined)continue;
+        const cached=new Set<number>();
+        for(const q of qc.getQueryCache().getAll()){const k=q.queryKey as unknown[];if(k[0]==="article"&&typeof k[1]==="number"&&q.state.data!==undefined)cached.add(k[1]);}
+        const reserved=selectedId!==undefined&&!cached.has(selectedId)?1:0;
+        if(cached.size+reserved>=PREFETCH_ARTICLE_BUDGET){onComplete?.();return;}
+        markPrefetchedArticle(id);
+        void (async()=>{
+          try{await qc.prefetchQuery({queryKey:["article",id],queryFn:()=>api.getArticle({id}),staleTime:60_000,gcTime:30*60_000});}catch{/* Prefetch failures are silent. */}
+          if(stopped)return;
+          if(queue.length)cancels.push(scheduleIdle(step));
+          else onComplete?.();
+        })();
+        return;
+      }
+      onComplete?.();
+    };
+    cancels.push(scheduleIdle(step));
+    return ()=>{stopped=true;for(const c of cancels)c();};
+  };
+  // Reader neighbours: only once the open article itself has fully loaded
+  // and is not revalidating, so prefetching never competes with it.
+  useEffect(()=>{
+    if(selectedId===undefined)return;
+    if(!article.data||article.data.article.id!==selectedId||article.isFetching)return;
+    const idx=readerQueue.findIndex(item=>item.id===selectedId);
+    if(idx<0)return;
+    const neighbours=[readerQueue[idx-1]?.id,readerQueue[idx+1]?.id].filter((id):id is number=>typeof id==="number"&&id!==selectedId);
+    if(!neighbours.length)return;
+    return schedulePrefetches(neighbours);
+  },[selectedId,readerQueue,article.data,article.isFetching]);
+  // List tops: the first few inbox articles (or the head of each board
+  // column), once per distinct top set, after the list has settled and no
+  // article is open. Search results are not prefetched.
+  const topListIds=useMemo(()=>{
+    if(debouncedSearch)return [] as number[];
+    if(view==="Board")return board.data?board.data.columns.map(c=>c.articles[0]?.id).filter((id):id is number=>typeof id==="number").slice(0,5):[];
+    if(view==="Main"||view==="Theme"||view==="Feed")return articles.slice(0,5).map(a=>a.id);
+    return [] as number[];
+  },[debouncedSearch,view,board.data,articles]);
+  const topListKey=topListIds.join(",");
+  const listPrefetchDoneRef=useRef<Set<string>>(new Set());
+  useEffect(()=>{
+    if(!topListKey||selectedId!==undefined)return;
+    if(listPrefetchDoneRef.current.has(topListKey))return;
+    if(view==="Board"?board.isFetching:dash.isFetching)return;
+    // Mark the top set done only when its prefetch chain actually drains:
+    // if the chain is cancelled first (the user opens an article, the list
+    // refetches), the key stays unmarked and the effect retries when the
+    // list settles again.
+    return schedulePrefetches(topListIds,()=>{listPrefetchDoneRef.current.add(topListKey);});
+  },[topListKey,selectedId,view,dash.isFetching,board.isFetching]);
   const activeLabel=view==="Main"?"Inbox":view==="Board"?"Board":view==="Theme"?theme??"Theme":view==="Feed"?dash.data?.feeds.find(f=>f.id===feedId)?.title??"Feed":view;
   useEffect(()=>{setCursor(0)},[view,theme,feedId,debouncedSearch]);
   useEffect(()=>{setCursor(current=>Math.min(current,Math.max(articles.length-1,0)))},[articles.length]);
@@ -555,6 +900,7 @@ export function App(){
         <button className="icon-button help-button" aria-label="Show keyboard shortcuts" onClick={()=>setShowShortcuts(true)}><Icon name="help"/></button>
         <button className={refresh.isPending?"icon-button refresh-button is-spinning":"icon-button refresh-button"} aria-label={refresh.isPending?"Refreshing feeds":"Refresh feeds"} aria-busy={refresh.isPending} onClick={()=>refresh.mutate()} disabled={refresh.isPending}><Icon name="refresh"/></button>
       </header>
+      {pendingQueue.length>0&&<div className="offline-queue-notice" role="status" aria-live="polite"><span>{pendingQueue.length===1?"1 change will sync when you're back online":`${pendingQueue.length} changes will sync when you're back online`}</span></div>}
       {notice&&<button className="notice" onClick={()=>setNotice(undefined)} aria-label="Dismiss status">{notice}</button>}
       {undoArchive&&<div className="notice undo-notice" role="status"><span>Archived</span><button type="button" onClick={undoArchived}>Undo</button></div>}
       {view==="Board"?<BoardView data={board.data} loading={board.isPending} error={board.error} query={debouncedSearch} onOpen={(queue,id)=>{setReaderQueue(queue);setOpenedIds([id]);setSelectedId(id)}} onToggleStar={a=>state.mutate({id:a.id,starred:!a.starred})} onViewTheme={name=>choose("Theme",name)} onMarkThemeRead={name=>markThemeRead.mutate(name)} marking={markThemeRead.isPending} onReorder={order=>reorderThemes.mutate(order)} reordering={reorderThemes.isPending}/>:view==="Brief"?<BriefView data={brief.data} loading={brief.isPending} error={brief.error} summaries={summaries} summariesLoading={summaryQuery.isPending} activeRanked={activeRanked} quietList={quietList} movedIds={movedIds} pinnedIds={pinnedIds} marksReady={marksBase!==null} cursor={briefCursor} isDesktop={isDesktop} paneDossier={paneDossier} paneLoading={paneQuery.isPending} actions={dossierActions} onOpen={openBriefArticle} onFeedback={(editionId,storyKey,type,topic,feed)=>briefFeedback.mutate({editionId,storyKey,type,topic,feed})} onShowDossier={showDossier} onFullDossier={openFullDossier} onSelectDossier={d=>{setBriefCursor(activeRanked.findIndex(x=>x.id===d.id));setPaneDossierId(d.id);recordView(d.id);}} onToggleCard={d=>{setBriefCursor(activeRanked.findIndex(x=>x.id===d.id));recordView(d.id);}} onOpenArticle={openDossierArticle}/>:view==="Library"?<LibraryView items={library.data?.items??[]} loading={library.isPending} query={debouncedSearch} saving={saveNote.isPending||deleteHighlight.isPending} starred={starredDash.data?.articles??[]} starredLoading={starredDash.isPending} starredError={starredDash.error} archived={archivedDash.data?.articles??[]} archivedLoading={archivedDash.isPending} archivedError={archivedDash.error} archiveOpen={archiveOpen} onToggleArchive={()=>setArchiveOpen(open=>!open)} onOpenStarred={(id,index)=>{const list=starredDash.data?.articles??[];setCursor(index);setReaderQueue(list);setOpenedIds([id]);setSelectedId(id)}} onOpenArchived={(id,index)=>{const list=archivedDash.data?.articles??[];setCursor(index);setReaderQueue(list);setOpenedIds([id]);setSelectedId(id)}} onToggleStar={a=>state.mutate({id:a.id,starred:!a.starred})} onToggleRead={a=>state.mutate({id:a.id,read:!a.read_at})} onDeleteArticle={a=>setDeleteTarget({id:a.id,title:a.title,fromReader:false})} onArchive={archiveFromList} onNavigate={next=>choose(next)} onSaveNote={(articleId,text)=>saveNote.mutate({article_id:articleId,text})} onDeleteHighlight={id=>deleteHighlight.mutate(id)} onExport={async()=>{try{const r=await api.exportMarkdown({});downloadFile(r.filename,r.content,"text/markdown")}catch{mutationError()}}}/>:view==="Organize"?<OrganizeFeeds data={dash.data} search={search} adding={addFeed.isPending} renaming={renameTheme.isPending} onAdd={(url,title,themeId)=>addFeed.mutate({url,title:title||undefined,theme_id:themeId})} onFeed={args=>updateFeed.mutate(args)} onRename={(id,name)=>renameTheme.mutate({id,name})} onDelete={id=>deleteFeed.mutate(id)}/>:view==="Settings"?<Settings data={dash.data} onRetention={d=>setRetention.mutate(d)} onExport={async()=>{try{const r=await api.exportOpml({});downloadFile(r.filename,r.content,"text/xml")}catch{mutationError()}}}/>:<>
@@ -585,7 +931,7 @@ function BoardCard({article,query,onOpen,onToggleStar}:{article:Article;query:st
       {article.excerpt&&<p><HighlightText text={article.excerpt} query={query}/></p>}
       <div className="board-card-meta"><span>{article.read_minutes} min read</span>{article.author&&<span className="board-card-author"><HighlightText text={article.author} query={query}/></span>}</div>
     </div>
-    <button type="button" className={article.starred?"board-star starred":"board-star"} aria-label={article.starred?`Unstar ${article.title}`:`Star ${article.title}`} aria-pressed={article.starred} onClick={()=>onToggleStar(article)}><Icon name="star" size={16}/></button>
+    <button type="button" className={article.starred?"board-star starred":"board-star"} aria-label={article.starred?`Unstar ${article.title}`:`Star ${article.title}`} aria-pressed={article.starred} onClick={()=>onToggleStar(article)}><Icon name="star" size={18}/></button>
   </article>;
 }
 function BoardView({data,loading,error,query,onOpen,onToggleStar,onViewTheme,onMarkThemeRead,marking,onReorder,reordering}:{data:BoardData|undefined;loading:boolean;error:unknown;query:string;onOpen:(queue:Article[],id:number)=>void;onToggleStar:(a:Article)=>void;onViewTheme:(name:string)=>void;onMarkThemeRead:(name:string)=>void;marking:boolean;onReorder:(order:number[])=>void;reordering:boolean}){
@@ -649,41 +995,45 @@ function BoardView({data,loading,error,query,onOpen,onToggleStar,onViewTheme,onM
 }
 function ArticleRow({article,index,cursor,query,onOpen,onToggleStar,onToggleRead,onDelete,onArchive}:{article:Article;index:number;cursor:number;query:string;onOpen:(id:number,index:number)=>void;onToggleStar:(a:Article)=>void;onToggleRead:(a:Article)=>void;onDelete:(a:Article)=>void;onArchive?:(a:Article)=>void}){
   const downPos=useRef<{x:number;y:number}|null>(null);
-  // Swipe-to-archive (touch only): a left swipe that is clearly horizontal
-  // (locks only past 12px with |dx| > 1.4x|dy|, so vertical scrolling and
-  // taps are never mistaken for it) slides the row over an Archive reveal;
-  // past the 84px threshold the row animates out and archives via the
-  // existing article-state action, otherwise it snaps back. touch-action
-  // pan-y keeps vertical scrolling native; the browser fires pointercancel
-  // when a scroll takes over, which also snaps back.
+  // Swipe-to-archive (touch only): a left-to-right swipe that is clearly
+  // horizontal (locks only past 12px with |dx| > 1.4x|dy|, so vertical
+  // scrolling and taps are never mistaken for it) slides the row over an
+  // Archive reveal on the left; past the 84px threshold the row animates
+  // out and archives via the existing article-state action, otherwise it
+  // snaps back. touch-action pan-y keeps vertical scrolling native; the
+  // browser fires pointercancel when a scroll takes over, which also
+  // snaps back.
   const [offset,setOffset]=useState(0);
   const [dragging,setDragging]=useState(false);
+  // One-shot pop on the star icon when tapped, so the tap itself is visibly
+  // acknowledged even before the (now optimistic) fill lands.
+  const [starPop,setStarPop]=useState(false);
   const gesture=useRef<{startX:number;startY:number;locked:boolean;pointerId:number}|null>(null);
   const suppressClick=useRef(false);
   const swipeEnabled=onArchive!==undefined;
   const endGesture=(commit:boolean)=>{
     const g=gesture.current; gesture.current=null; setDragging(false);
     if(!g||!g.locked)return;
-    if(commit&&offset<=-84){
+    if(commit&&offset>=84){
       suppressClick.current=true;
-      setOffset(-420);
+      setOffset(420);
       window.setTimeout(()=>{onArchive?.(article);setOffset(0);},190);
     } else setOffset(0);
   };
-  const row=<article data-article-index={index} className={`${article.read_at?"article-row read":"article-row unread"} ${cursor===index?"keyboard-focus":""}`}><div className="article-main" role="button" tabIndex={0} onPointerDown={e=>{downPos.current={x:e.clientX,y:e.clientY}}} onClick={e=>{if(suppressClick.current){suppressClick.current=false;return;}const start=downPos.current;downPos.current=null;if(start&&Math.hypot(e.clientX-start.x,e.clientY-start.y)>6)return;const sel=window.getSelection();if(sel&&!sel.isCollapsed)return;onOpen(article.id,index)}} onKeyDown={e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();onOpen(article.id,index)}}}><div className="article-copy"><div className="article-source"><span><HighlightText text={article.theme} query={query}/></span><b><HighlightText text={article.feed} query={query}/></b><time>{relativeTime(article.published_at??article.ingested_at)}</time></div><h2><HighlightText text={article.title} query={query}/></h2>{article.excerpt&&<p><HighlightText text={article.excerpt} query={query}/></p>}<div className="article-meta">{article.author&&<span><HighlightText text={article.author} query={query}/></span>}<span>{article.read_minutes} min read</span></div></div>{article.image_url&&<img className="article-thumbnail" src={article.image_url} alt={article.image_alt&&article.image_alt!==article.title?article.image_alt:""} loading="lazy"/>}</div><div className="row-actions"><button aria-label={article.starred?`Unstar ${article.title}`:`Star ${article.title}`} className={article.starred?"starred":""} onClick={()=>onToggleStar(article)}><Icon name="star" size={17}/></button><button aria-label={article.read_at?`Mark ${article.title} unread`:`Mark ${article.title} read`} onClick={()=>onToggleRead(article)}>{article.read_at?"Unread":"Read"}</button><button className="delete-row" aria-label={`Delete ${article.title}`} onClick={()=>onDelete(article)}><Icon name="trash" size={16}/></button></div></article>;
+  const row=<article data-article-index={index} className={`${article.read_at?"article-row read":"article-row unread"} ${cursor===index?"keyboard-focus":""}`}><div className="article-main" role="button" tabIndex={0} onPointerDown={e=>{downPos.current={x:e.clientX,y:e.clientY}}} onClick={e=>{if(suppressClick.current){suppressClick.current=false;return;}const start=downPos.current;downPos.current=null;if(start&&Math.hypot(e.clientX-start.x,e.clientY-start.y)>6)return;const sel=window.getSelection();if(sel&&!sel.isCollapsed)return;onOpen(article.id,index)}} onKeyDown={e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();onOpen(article.id,index)}}}><div className="article-copy"><div className="article-source"><span><HighlightText text={article.theme} query={query}/></span><b><HighlightText text={article.feed} query={query}/></b><time>{relativeTime(article.published_at??article.ingested_at)}</time></div><h2><HighlightText text={article.title} query={query}/></h2>{article.excerpt&&<p><HighlightText text={article.excerpt} query={query}/></p>}<div className="article-meta">{article.author&&<span><HighlightText text={article.author} query={query}/></span>}<span>{article.read_minutes} min read</span></div></div>{article.image_url&&<img className="article-thumbnail" src={article.image_url} alt={article.image_alt&&article.image_alt!==article.title?article.image_alt:""} loading="lazy"/>}</div><div className="row-actions"><button aria-label={article.starred?`Unstar ${article.title}`:`Star ${article.title}`} aria-pressed={article.starred} className={`star-button${article.starred?" starred":""}${starPop?" star-pop":""}`} onClick={()=>{setStarPop(true);onToggleStar(article);}} onAnimationEnd={()=>setStarPop(false)}><Icon name="star" size={20}/></button><button aria-label={article.read_at?`Mark ${article.title} unread`:`Mark ${article.title} read`} onClick={()=>onToggleRead(article)}>{article.read_at?"Unread":"Read"}</button><button className="delete-row" aria-label={`Delete ${article.title}`} onClick={()=>onDelete(article)}><Icon name="trash" size={16}/></button></div></article>;
   if(!swipeEnabled)return row;
   return <div className="swipe-row">
-    <div className="swipe-reveal" aria-hidden="true" style={{opacity:offset<-10?1:0}}><Icon name="archive" size={17}/><span>Archive</span></div>
+    <div className="swipe-reveal" aria-hidden="true" style={{opacity:offset>10?1:0}}><Icon name="archive" size={17}/><span>Archive</span></div>
     <div className="swipe-inner" style={{transform:`translateX(${offset}px)`,transition:dragging?"none":"transform .19s ease",touchAction:"pan-y"}}
       onPointerDown={e=>{if(e.pointerType!=="touch")return;gesture.current={startX:e.clientX,startY:e.clientY,locked:false,pointerId:e.pointerId};}}
       onPointerMove={e=>{const g=gesture.current;if(!g||e.pointerId!==g.pointerId)return;const dx=e.clientX-g.startX;const dy=e.clientY-g.startY;
-        if(!g.locked){if(Math.abs(dy)>10&&Math.abs(dy)>=Math.abs(dx)){gesture.current=null;return;}if(dx<-12&&Math.abs(dx)>Math.abs(dy)*1.4){g.locked=true;setDragging(true);}else return;}
-        setOffset(Math.max(-128,Math.min(0,dx)));}}
+        if(!g.locked){if(Math.abs(dy)>10&&Math.abs(dy)>=Math.abs(dx)){gesture.current=null;return;}if(dx>12&&Math.abs(dx)>Math.abs(dy)*1.4){g.locked=true;setDragging(true);}else return;}
+        setOffset(Math.max(0,Math.min(128,dx)));}}
       onPointerUp={e=>{if(e.pointerId===gesture.current?.pointerId)endGesture(true);}}
       onPointerCancel={()=>endGesture(false)}>{row}</div>
   </div>;
 }
-function ArticleList({articles,loading,error,cursor,query,onOpen,onToggleStar,onToggleRead,onDelete,onArchive,hasMore,onLoadMore}:{articles:Article[];loading:boolean;error:unknown;cursor:number;query:string;onOpen:(id:number,index:number)=>void;onToggleStar:(a:Article)=>void;onToggleRead:(a:Article)=>void;onDelete:(a:Article)=>void;onArchive?:(a:Article)=>void;hasMore?:boolean;onLoadMore?:()=>void}){if(loading)return <div className="state-page">Loading your feeds…</div>;if(error)return <div className="state-page"><strong>Could not load the inbox.</strong><span>Try again in a moment.</span></div>;if(!articles.length)return <div className="state-page">{query?<><strong>No matches for “{query}”.</strong><span>Try a different search, or clear it to see everything.</span></>:<><strong>Nothing here.</strong><span>Refresh feeds or choose another view.</span></>}</div>;return <section className="article-list" aria-label="Articles">{articles.map((a,i)=><ArticleRow key={a.id} article={a} index={i} cursor={cursor} query={query} onOpen={onOpen} onToggleStar={onToggleStar} onToggleRead={onToggleRead} onDelete={onDelete} onArchive={onArchive}/>)}{hasMore&&onLoadMore&&<button type="button" className="list-load-more" onClick={onLoadMore}>Show more articles</button>}</section>}
+function ArticleList({articles,loading,error,cursor,query,onOpen,onToggleStar,onToggleRead,onDelete,onArchive,hasMore,onLoadMore}:{articles:Article[];loading:boolean;error:unknown;cursor:number;query:string;onOpen:(id:number,index:number)=>void;onToggleStar:(a:Article)=>void;onToggleRead:(a:Article)=>void;onDelete:(a:Article)=>void;onArchive?:(a:Article)=>void;hasMore?:boolean;onLoadMore?:()=>void}){if(loading&&articles.length===0)return <div className="state-page">Loading your feeds…</div>;if(error&&articles.length===0)return <div className="state-page"><strong>Could not load the inbox.</strong><span>Try again in a moment.</span></div>;if(!articles.length)return <div className="state-page">{query?<><strong>No matches for “{query}”.</strong><span>Try a different search, or clear it to see everything.</span></>:<><strong>Nothing here.</strong><span>Refresh feeds or choose another view.</span></>}</div>;return <section className="article-list" aria-label="Articles">{articles.map((a,i)=><ArticleRow key={a.id} article={a} index={i} cursor={cursor} query={query} onOpen={onOpen} onToggleStar={onToggleStar} onToggleRead={onToggleRead} onDelete={onDelete} onArchive={onArchive}/>)}{hasMore&&onLoadMore&&<button type="button" className="list-load-more" onClick={onLoadMore}>Show more articles</button>}</section>}
 type ReaderPhoto=ApiResponse<typeof api,"getArticle">["article"]["photos"][number];
 function normalizeCaptionText(value:string):string{return value.toLowerCase().replace(/\s+/g," ").replace(/^[“"']+|[”"']+$/g,"").trim();}
 // Places pulled photos into the article body at their story positions.
@@ -757,7 +1107,21 @@ function Reader({data,loading,error,closing,position,total,shortcutsOpen,stacked
   const bodyRef=useRef<HTMLDivElement>(null);
   const headingRef=useRef<HTMLHeadingElement>(null);
   const selectionRef=useRef("");
-  useEffect(()=>{setNote(data?.note??"")},[data?.id,data?.note]);
+  // Note sync guard (Phase 2): a background revalidation can land while
+  // the reader is open. Adopt the server note on article change, or when
+  // it changed elsewhere AND the local draft still matches the last
+  // synced server value; a draft the user has edited is never overwritten.
+  const noteSyncRef=useRef<{id:number|undefined;server:string}>({id:undefined,server:""});
+  useEffect(()=>{
+    if(!data)return;
+    const server=data.note??"";
+    const prev=noteSyncRef.current;
+    if(prev.id!==data.id){noteSyncRef.current={id:data.id,server};setNote(server);return;}
+    if(server!==prev.server){
+      noteSyncRef.current={id:data.id,server};
+      setNote(current=>current===prev.server?server:current);
+    }
+  },[data]);
   const fetchPhotos=useMutation({mutationFn:(id:number)=>api.fetch_photos({id}),onSuccess:(r,vars)=>{if(r.ok){setPhotoError(null);void qcReader.invalidateQueries({queryKey:["article",vars]});void qcReader.invalidateQueries({queryKey:["dashboard"]});void qcReader.invalidateQueries({queryKey:["board"]});}else setPhotoError(r.error??"Couldn't pull photos for this article.");},onError:()=>setPhotoError("Couldn't pull photos for this article.")});
   useEffect(()=>{setSpeedOpen(false);setFetchError(null);setPhotoError(null)},[data?.id]);
   useEffect(()=>{selectionRef.current="";setSelection("");headingRef.current?.focus({preventScroll:true});scrollRef.current?.scrollTo({top:0,behavior:"auto"})},[data?.id]);
@@ -812,7 +1176,7 @@ function Reader({data,loading,error,closing,position,total,shortcutsOpen,stacked
   // When the lead pulled photo was also saved as the article's image, the
   // standalone header image would duplicate the inline lead figure.
   const showHeaderImage=Boolean(data?.image_url)&&!(photos.length>0&&data?.image_url===photos[0]?.url);
-  return <div className={stacked?"reader-backdrop reader-backdrop-stacked":"reader-backdrop"}><section className="reader" aria-label="Article reader"><header className="reader-bar"><button className="icon-button" aria-label={closing?"Saving reading progress":"Close article"} onClick={onClose} disabled={closing}><Icon name="back"/></button>{data&&<div className="reader-actions"><button className={data.starred?"starred":""} onClick={()=>onStar(data)} disabled={closing}><Icon name="star" size={17}/>{data.starred?"Starred":"Star"}</button><button onClick={()=>onUnread(data)} disabled={closing}>Unread</button><button onClick={()=>onArchive(data)} disabled={closing}>{closing?"Saving…":data.archived_at?"Restore":"Archive"}</button><button className="reader-delete" onClick={()=>onDeleteArticle(data)} disabled={closing}><Icon name="trash" size={15}/>Delete</button><a href={data.url} target="_blank" rel="noreferrer">Original <Icon name="external" size={15}/></a></div>}</header>{error?<div className="state-page"><strong>Could not open this article.</strong><span>Close the reader and try again.</span></div>:loading||!data?<div className="state-page">Opening article…</div>:<><div className="reader-scroll" ref={scrollRef}><div className="reader-heading"><div>{data.theme} · {data.feed}</div><h1 ref={headingRef} tabIndex={-1}>{data.title}</h1><p>{[data.author,agoText(data.published_at??data.ingested_at),`${data.read_minutes} min read`].filter(Boolean).join(" · ")}</p><button type="button" className="speed-read-cta" aria-label={`Speed read ${data.title}`} onClick={()=>setSpeedOpen(true)} disabled={closing}>▶ Speed read this article</button></div>{showHeaderImage&&data.image_url&&<img className="reader-image" src={data.image_url} alt={data.image_alt??data.title}/>}{isSnippet&&<div className="full-text-box" role={fetchError?"alert":undefined}><p>{fetchError??"This feed only included a short preview of the article."}</p><div className="full-text-actions"><button type="button" className="full-text-button" disabled={fetchFullText.isPending||closing} aria-busy={fetchFullText.isPending} onClick={()=>fetchFullText.mutate(data.id)}>{fetchFullText.isPending?"Fetching full text…":fetchError?"Try again":"Fetch full text"}</button><a href={data.url} target="_blank" rel="noreferrer">Open original <Icon name="external" size={14}/></a></div></div>}{photos.length===0&&<div className="full-text-box photos-box" role={photoError?"alert":undefined}><p>{photoError??"This article's photos aren't in the feed."}</p><div className="full-text-actions"><button type="button" className="full-text-button" disabled={fetchPhotos.isPending||closing} aria-busy={fetchPhotos.isPending} onClick={()=>fetchPhotos.mutate(data.id)}>{fetchPhotos.isPending?"Pulling photos…":photoError?"Try again":"Pull photos"}</button><a href={data.url} target="_blank" rel="noreferrer">Open original <Icon name="external" size={14}/></a></div></div>}<div className="reader-body" ref={bodyRef}>{data.body?<ArticleContent html={enrichedBody??data.body}/>:<p>{data.excerpt??"This feed did not include article text. Use Original to read it at the source."}</p>}</div><section className="annotations"><div className="annotation-heading"><h2>Notes</h2>{data.note&&<button className="delete-note" onClick={()=>setConfirmNoteDelete(true)}>Delete note</button>}</div><textarea {...FIELDS.saveNote.text} aria-label="Article note" value={note} onChange={e=>setNote(e.target.value)} placeholder="What do you want to remember?"/><button className="primary-button" onClick={()=>onNote(data.id,note)}>Save note</button>{data.highlights.length>0&&<div className="highlight-stack"><h2>Highlights</h2>{data.highlights.map(h=><div className="highlight-item" key={h.id}><blockquote>{h.text}</blockquote><button aria-label={`Delete highlight: ${h.text.slice(0,60)}`} onClick={()=>onDeleteHighlight(h.id)}>Delete</button></div>)}</div>}</section></div><button className={selection?"save-selection is-visible":"save-selection"} aria-hidden={!selection} disabled={!selection} onPointerDown={event=>event.preventDefault()} onClick={()=>{const text=selectionRef.current;if(!text)return;onHighlight(data.id,text);selectionRef.current="";setSelection("");window.getSelection()?.removeAllRanges()}}>Save selected text</button><nav className="reader-navigation" aria-label="Article navigation"><button aria-label="Previous article, keyboard shortcut K" onClick={onPrevious} disabled={closing||!onPrevious}><Icon name="up"/><span><small>Previous <kbd>K</kbd></small><strong>Article</strong></span></button><div aria-live="polite">{closing?"Saving…":position?`${position} of ${total}`:"Article"}</div><button aria-label="Next article, keyboard shortcut J" onClick={onNext} disabled={closing||!onNext}><span><small>Next <kbd>J</kbd></small><strong>Article</strong></span><Icon name="down"/></button></nav></>}</section>{confirmNoteDelete&&data&&<ConfirmDialog title="Delete note?" body="This note will be removed from your reading memory. The article and any highlights will stay." onCancel={()=>setConfirmNoteDelete(false)} onConfirm={()=>{onNote(data.id,"");setNote("");setConfirmNoteDelete(false)}}/>}{speedOpen&&data&&<SpeedReader articleId={data.id} title={data.title} subtitle={`${data.feed}`} text={htmlToPlainText(data.body,data.excerpt)} onBack={()=>setSpeedOpen(false)}/>}</div>
+  return <div className={stacked?"reader-backdrop reader-backdrop-stacked":"reader-backdrop"}><section className="reader" aria-label="Article reader"><header className="reader-bar"><button className="icon-button" aria-label={closing?"Saving reading progress":"Close article"} onClick={onClose} disabled={closing}><Icon name="back"/></button>{data&&<div className="reader-actions"><button className={data.starred?"starred":""} onClick={()=>onStar(data)} disabled={closing}><Icon name="star" size={17}/>{data.starred?"Starred":"Star"}</button><button onClick={()=>onUnread(data)} disabled={closing}>Unread</button><button onClick={()=>onArchive(data)} disabled={closing}>{closing?"Saving…":data.archived_at?"Restore":"Archive"}</button><button className="reader-delete" onClick={()=>onDeleteArticle(data)} disabled={closing}><Icon name="trash" size={15}/>Delete</button><a href={data.url} target="_blank" rel="noreferrer">Original <Icon name="external" size={15}/></a></div>}</header>{error&&!data?<div className="state-page"><strong>Could not open this article.</strong><span>Close the reader and try again.</span></div>:loading||!data?<div className="state-page">Opening article…</div>:<><div className="reader-scroll" ref={scrollRef}><div className="reader-heading"><div>{data.theme} · {data.feed}</div><h1 ref={headingRef} tabIndex={-1}>{data.title}</h1><p>{[data.author,agoText(data.published_at??data.ingested_at),`${data.read_minutes} min read`].filter(Boolean).join(" · ")}</p><button type="button" className="speed-read-cta" aria-label={`Speed read ${data.title}`} onClick={()=>setSpeedOpen(true)} disabled={closing}>▶ Speed read this article</button></div>{showHeaderImage&&data.image_url&&<img className="reader-image" src={data.image_url} alt={data.image_alt??data.title}/>}{isSnippet&&<div className="full-text-box" role={fetchError?"alert":undefined}><p>{fetchError??"This feed only included a short preview of the article."}</p><div className="full-text-actions"><button type="button" className="full-text-button" disabled={fetchFullText.isPending||closing} aria-busy={fetchFullText.isPending} onClick={()=>fetchFullText.mutate(data.id)}>{fetchFullText.isPending?"Fetching full text…":fetchError?"Try again":"Fetch full text"}</button><a href={data.url} target="_blank" rel="noreferrer">Open original <Icon name="external" size={14}/></a></div></div>}{photos.length===0&&<div className="full-text-box photos-box" role={photoError?"alert":undefined}><p>{photoError??"This article's photos aren't in the feed."}</p><div className="full-text-actions"><button type="button" className="full-text-button" disabled={fetchPhotos.isPending||closing} aria-busy={fetchPhotos.isPending} onClick={()=>fetchPhotos.mutate(data.id)}>{fetchPhotos.isPending?"Pulling photos…":photoError?"Try again":"Pull photos"}</button><a href={data.url} target="_blank" rel="noreferrer">Open original <Icon name="external" size={14}/></a></div></div>}<div className="reader-body" ref={bodyRef}>{data.body?<ArticleContent html={enrichedBody??data.body}/>:<p>{data.excerpt??"This feed did not include article text. Use Original to read it at the source."}</p>}</div><section className="annotations"><div className="annotation-heading"><h2>Notes</h2>{data.note&&<button className="delete-note" onClick={()=>setConfirmNoteDelete(true)}>Delete note</button>}</div><textarea {...FIELDS.saveNote.text} aria-label="Article note" value={note} onChange={e=>setNote(e.target.value)} placeholder="What do you want to remember?"/><button className="primary-button" onClick={()=>onNote(data.id,note)}>Save note</button>{data.highlights.length>0&&<div className="highlight-stack"><h2>Highlights</h2>{data.highlights.map(h=><div className="highlight-item" key={h.id}><blockquote>{h.text}</blockquote><button aria-label={`Delete highlight: ${h.text.slice(0,60)}`} onClick={()=>onDeleteHighlight(h.id)}>Delete</button></div>)}</div>}</section></div><button className={selection?"save-selection is-visible":"save-selection"} aria-hidden={!selection} disabled={!selection} onPointerDown={event=>event.preventDefault()} onClick={()=>{const text=selectionRef.current;if(!text)return;onHighlight(data.id,text);selectionRef.current="";setSelection("");window.getSelection()?.removeAllRanges()}}>Save selected text</button><nav className="reader-navigation" aria-label="Article navigation"><button aria-label="Previous article, keyboard shortcut K" onClick={onPrevious} disabled={closing||!onPrevious}><Icon name="up"/><span><small>Previous <kbd>K</kbd></small><strong>Article</strong></span></button><div aria-live="polite">{closing?"Saving…":position?`${position} of ${total}`:"Article"}</div><button aria-label="Next article, keyboard shortcut J" onClick={onNext} disabled={closing||!onNext}><span><small>Next <kbd>J</kbd></small><strong>Article</strong></span><Icon name="down"/></button></nav></>}</section>{confirmNoteDelete&&data&&<ConfirmDialog title="Delete note?" body="This note will be removed from your reading memory. The article and any highlights will stay." onCancel={()=>setConfirmNoteDelete(false)} onConfirm={()=>{onNote(data.id,"");setNote("");setConfirmNoteDelete(false)}}/>}{speedOpen&&data&&<SpeedReader articleId={data.id} title={data.title} subtitle={`${data.feed}`} text={htmlToPlainText(data.body,data.excerpt)} onBack={()=>setSpeedOpen(false)}/>}</div>
 }
 function LibraryView({items,loading,query,saving,starred,starredLoading,starredError,archived,archivedLoading,archivedError,archiveOpen,onToggleArchive,onOpenStarred,onOpenArchived,onToggleStar,onToggleRead,onDeleteArticle,onArchive,onNavigate,onSaveNote,onDeleteHighlight,onExport}:{items:ApiResponse<typeof api,"library">["items"];loading:boolean;query:string;saving:boolean;starred:Article[];starredLoading:boolean;starredError:unknown;archived:Article[];archivedLoading:boolean;archivedError:unknown;archiveOpen:boolean;onToggleArchive:()=>void;onOpenStarred:(id:number,index:number)=>void;onOpenArchived:(id:number,index:number)=>void;onToggleStar:(a:Article)=>void;onToggleRead:(a:Article)=>void;onDeleteArticle:(a:Article)=>void;onArchive?:(a:Article)=>void;onNavigate:(view:View)=>void;onSaveNote:(articleId:number,text:string)=>void;onDeleteHighlight:(id:number)=>void;onExport:()=>void}){
   const [editing,setEditing]=useState<number>();
@@ -823,7 +1187,7 @@ function LibraryView({items,loading,query,saving,starred,starredLoading,starredE
     <div className="section-lead"><div><h2>Library</h2><p>Everything you have kept: starred articles and saved snippets.</p></div><button className="text-button" onClick={onExport}>Export markdown</button></div>
     <section className="library-section" aria-label="Starred articles">
       <h3>Starred articles</h3>
-      {starredLoading?<p className="library-empty">Loading starred articles…</p>:starredError?<p className="library-empty">Could not load starred articles. Try again in a moment.</p>:starred.length===0?<p className="library-empty">{query?"No starred articles match your search.":"No starred articles yet. Star an article and it will live here."}</p>:<ArticleList articles={starred} loading={false} error={null} cursor={-1} query={query} onOpen={onOpenStarred} onToggleStar={onToggleStar} onToggleRead={onToggleRead} onDelete={onDeleteArticle} onArchive={onArchive}/>}
+      {starredLoading&&starred.length===0?<p className="library-empty">Loading starred articles…</p>:starredError&&starred.length===0?<p className="library-empty">Could not load starred articles. Try again in a moment.</p>:starred.length===0?<p className="library-empty">{query?"No starred articles match your search.":"No starred articles yet. Star an article and it will live here."}</p>:<ArticleList articles={starred} loading={false} error={null} cursor={-1} query={query} onOpen={onOpenStarred} onToggleStar={onToggleStar} onToggleRead={onToggleRead} onDelete={onDeleteArticle} onArchive={onArchive}/>}
     </section>
     <section className="library-section" aria-label="Saved snippets">
       <h3>Saved snippets</h3>
@@ -831,7 +1195,7 @@ function LibraryView({items,loading,query,saving,starred,starredLoading,starredE
     </section>
     <section className="library-section library-archive" aria-label="Archived articles">
       <button type="button" className="library-archive-toggle" aria-expanded={archiveOpen} onClick={onToggleArchive}><Icon name="archive" size={17}/><span>Archived articles</span><span className={archiveOpen?"library-chevron open":"library-chevron"}><Icon name="chevron" size={15}/></span></button>
-      {archiveOpen&&(archivedLoading?<p className="library-empty">Loading the archive…</p>:archivedError?<p className="library-empty">Could not load the archive. Try again in a moment.</p>:archived.length===0?<p className="library-empty">{query?"No archived articles match your search.":"Nothing in the archive."}</p>:<ArticleList articles={archived} loading={false} error={null} cursor={-1} query={query} onOpen={onOpenArchived} onToggleStar={onToggleStar} onToggleRead={onToggleRead} onDelete={onDeleteArticle}/>)}
+      {archiveOpen&&(archivedLoading&&archived.length===0?<p className="library-empty">Loading the archive…</p>:archivedError&&archived.length===0?<p className="library-empty">Could not load the archive. Try again in a moment.</p>:archived.length===0?<p className="library-empty">{query?"No archived articles match your search.":"Nothing in the archive."}</p>:<ArticleList articles={archived} loading={false} error={null} cursor={-1} query={query} onOpen={onOpenArchived} onToggleStar={onToggleStar} onToggleRead={onToggleRead} onDelete={onDeleteArticle}/>)}
     </section>
     <section className="library-section library-manage" aria-label="Manage">
       <button type="button" className="library-manage-row" onClick={()=>onNavigate("Organize")}><Icon name="organize" size={17}/><span>Organize feeds</span><Icon name="chevron" size={15}/></button>

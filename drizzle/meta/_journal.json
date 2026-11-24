@@ -85,6 +85,27 @@
       "when": 1795517894269,
       "tag": "0012_add_article_photos",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1795522604093,
+      "tag": "0013_add_perf_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1795523789165,
+      "tag": "0014_add_article_word_count",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1795526481812,
+      "tag": "0015_add_thumbnail_blob_keys",
+      "breakpoints": true
     }
   ]
 }

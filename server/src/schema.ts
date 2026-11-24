@@ -30,7 +30,19 @@ export const articles = sqliteTable("articles", {
   author: text("author"),
   excerpt: text("excerpt"),
   body: text("body"),
+  // Plain-text word count of the stored body, computed once when the body is
+  // written (ingest, refresh update, fetch_full_text) so list queries can
+  // derive read_minutes from a plain column instead of scanning every body
+  // per request (Phase 1 perf fix). Backfilled for existing rows by
+  // migration 0014 with the SQL approximation the list queries used before.
+  wordCount: integer("word_count"),
   imageBlobKey: text("image_blob_key"),
+  // Resized list-view variant of imageBlobKey (Phase 5): a small copy
+  // (480px wide) generated once via the privileged resizer and served to
+  // inbox/board/Library lists; the reader always uses imageBlobKey at
+  // full size. Equals imageBlobKey when the original is already small;
+  // null until generated (lists fall back to the original meanwhile).
+  thumbnailBlobKey: text("thumbnail_blob_key"),
   imageAlt: text("image_alt"),
   publishedAt: integer("published_at", { mode: "timestamp_ms" }),
   ingestedAt: integer("ingested_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
@@ -49,6 +61,10 @@ export const articlePhotos = sqliteTable("article_photos", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   articleId: integer("article_id").notNull().references(() => articles.id),
   blobKey: text("blob_key").notNull(),
+  // Resized variant of blobKey (Phase 5), generated like the article
+  // thumbnail; the reader renders blobKey full-size, lists never render
+  // pulled photos directly except through the article's lead thumbnail.
+  thumbnailBlobKey: text("thumbnail_blob_key"),
   sourceUrl: text("source_url").notNull(),
   caption: text("caption"),
   credit: text("credit"),
@@ -89,6 +105,21 @@ export const settings = sqliteTable("settings", {
   id: integer("id").primaryKey(),
   archiveDays: integer("archive_days").notNull().default(7),
   retentionDays: integer("retention_days").notNull().default(30),
+  perfPhase: text("perf_phase").notNull().default("baseline"),
+});
+
+// Lightweight performance samples (Phase 0 instrumentation). One row per
+// timed action or client-measured interaction: metric name, duration,
+// response payload size in bytes (null for client visual metrics), phase
+// label (e.g. "baseline", "phase1"), and timestamp. No article content,
+// titles, or user data is ever stored here.
+export const perfEvents = sqliteTable("perf_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  metric: text("metric").notNull(),
+  durationMs: integer("duration_ms").notNull(),
+  bytes: integer("bytes"),
+  phase: text("phase").notNull().default("baseline"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
 });
 
 export const pullRuns = sqliteTable("pull_runs", {
