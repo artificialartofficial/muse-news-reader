@@ -151,6 +151,11 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
     const format = sourceFormat(bytes);
     if (!format) return fail("Unrecognized image format", originalBytes);
     const dims = imageDimensions(bytes);
+    // Decompression-bomb guard: a tiny stored file can declare enormous
+    // dimensions; never hand those to GraphicsMagick to expand.
+    if (dims && (dims.width > 16384 || dims.height > 16384 || dims.width * dims.height > 40_000_000)) {
+      return fail("Image dimensions too large", originalBytes);
+    }
     // Already at or below the thumbnail width: no variant needed; the
     // caller records the original key as its own thumbnail.
     if (dims && dims.width <= args.maxWidth) {

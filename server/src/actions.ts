@@ -139,7 +139,127 @@ function attrLink(block: string): string {
   const alternate=links.find(attrs=>/\brel=["']alternate["']/i.test(attrs));
   return decodeXml(href(alternate??"")||href(links[0]??"")||plain(tag(block,["link"])));
 }
-function resolveUrl(value:string,baseUrl:string):string { if(!value)return "";try{return new URL(value,baseUrl).href}catch{return value} }
+function resolveUrl(value:string,baseUrl:string):string { if(!value)return "";try{const u=new URL(value,baseUrl);return u.protocol==="http:"||u.protocol==="https:"?u.href:""}catch{return ""} }
+function isHttpUrl(value:string):boolean { try{const u=new URL(value);return u.protocol==="http:"||u.protocol==="https:"}catch{return false} }
+
+// --- SSRF guard + capped server fetch (red-team fix) ----------------------
+// Every server-side fetch target in this app is ultimately third-party
+// controlled: feed URLs are user-added, and article / image URLs come from
+// feed content, so a malicious or compromised feed could otherwise point
+// the server at loopback, link-local (cloud metadata), or LAN addresses,
+// bounce it there through an open redirect, or stream an unbounded body
+// into memory. safeFetch therefore:
+// - allows only http/https, with no embedded credentials;
+// - blocks loopback / private / link-local / reserved IP literals and
+//   localhost-style hostnames, and checks DNS answers (via DNS-over-HTTPS)
+//   for hostnames, blocking when ANY answer is private (fail-open only
+//   when the lookup itself fails, so a DoH outage cannot break all feeds);
+// - follows redirects manually (max 5), re-validating every hop;
+// - reads the body with a hard byte cap, aborting as soon as it is passed
+//   instead of buffering the whole response first;
+// - runs under one overall timeout for the whole redirect chain.
+function ipv4Private(ip: string): boolean {
+  const parts = ip.split(".").map((p) => Number(p));
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return true;
+  const [a = 0, b = 0] = parts;
+  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19)) || a >= 240;
+}
+function ipv6Private(ip: string): boolean {
+  const h = ip.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "::1" || h === "::") return true;
+  if (h.startsWith("fe80:") || h.startsWith("fe9") || h.startsWith("fea") || h.startsWith("feb")) return true;
+  if (h.startsWith("fc") || h.startsWith("fd")) return true;
+  const mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped?.[1]) return ipv4Private(mapped[1]);
+  return false;
+}
+function hostIsBlockedLiteral(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.$/, "");
+  if (!h) return true;
+  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal") || h.endsWith(".home.arpa")) return true;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return ipv4Private(h);
+  if (h.includes(":")) return ipv6Private(h);
+  // Numeric / hex IPv4 spellings (2130706433, 0x7f000001, 0177.0.0.1) are
+  // parsed as IPs by fetch even though they do not look like dotted quads.
+  if (/^\d+$/.test(h) || /^0x[0-9a-f]+$/i.test(h) || /^[0-9.]+$/.test(h)) return true;
+  return false;
+}
+const dnsCache = new Map<string, { blocked: boolean; at: number }>();
+async function hostResolvesPrivate(hostname: string): Promise<boolean> {
+  const h = hostname.toLowerCase();
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h) || h.includes(":")) return false; // literal handled by caller
+  const cached = dnsCache.get(h);
+  if (cached && Date.now() - cached.at < 300000) return cached.blocked;
+  let blocked = false;
+  try {
+    for (const type of ["A", "AAAA"]) {
+      const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(h)}&type=${type}`, { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(3000), redirect: "error" });
+      if (!res.ok) continue;
+      const data = (await res.json()) as { Answer?: Array<{ data?: unknown }> };
+      for (const ans of data.Answer ?? []) {
+        const ip = typeof ans.data === "string" ? ans.data : "";
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(ip) && ipv4Private(ip)) blocked = true;
+        if (ip.includes(":") && ipv6Private(ip)) blocked = true;
+      }
+      if (blocked) break;
+    }
+  } catch { /* Lookup failed: fail open (literal + redirect checks still apply). */ }
+  dnsCache.set(h, { blocked, at: Date.now() });
+  if (dnsCache.size > 500) dnsCache.clear();
+  return blocked;
+}
+async function assertPublicUrl(raw: string): Promise<URL | null> {
+  let u: URL;
+  try { u = new URL(raw); } catch { return null; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  if (u.username || u.password) return null;
+  if (hostIsBlockedLiteral(u.hostname)) return null;
+  if (await hostResolvesPrivate(u.hostname)) return null;
+  return u;
+}
+async function readBodyCapped(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const declared = Number(response.headers.get("content-length") ?? "0");
+  if (declared > maxBytes) throw new Error("Response too large");
+  const body = response.body;
+  if (!body) { const buf = new Uint8Array(await response.arrayBuffer()); if (buf.length > maxBytes) throw new Error("Response too large"); return buf; }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) { total += value.length; if (total > maxBytes) { try { await reader.cancel(); } catch { /* already closing */ } throw new Error("Response too large"); } chunks.push(value); }
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+type SafeFetchResult = { ok: boolean; status: number; finalUrl: string; bytes: Uint8Array };
+async function safeFetch(rawUrl: string, init: { headers: Record<string, string>; timeoutMs: number; maxBytes: number }): Promise<SafeFetchResult> {
+  let current = await assertPublicUrl(rawUrl);
+  if (!current) throw new Error("Blocked or invalid URL");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), init.timeoutMs);
+  try {
+    for (let hop = 0; hop <= 5; hop += 1) {
+      const response = await fetch(current.href, { headers: init.headers, signal: controller.signal, redirect: "manual" });
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        try { await response.body?.cancel(); } catch { /* ignore */ }
+        if (!location || hop === 5) return { ok: false, status: response.status, finalUrl: current.href, bytes: new Uint8Array() };
+        const next = await assertPublicUrl(new URL(location, current.href).href);
+        if (!next) throw new Error("Blocked redirect target");
+        current = next;
+        continue;
+      }
+      if (!response.ok) return { ok: false, status: response.status, finalUrl: current.href, bytes: new Uint8Array() };
+      const bytes = await readBodyCapped(response, init.maxBytes);
+      return { ok: true, status: response.status, finalUrl: current.href, bytes };
+    }
+    return { ok: false, status: 0, finalUrl: current.href, bytes: new Uint8Array() };
+  } finally { clearTimeout(timer); }
+}
 function parseFeedTitle(xml: string): string {
   const channel = xml.match(/<channel\b[\s\S]*?<\/channel>/i)?.[0];
   if (channel) return plain(tag(channel, ["title"]));
@@ -195,7 +315,11 @@ function parseFeed(xml: string, baseUrl: string): ParsedFeedItem[] {
     const guid = plain(tag(block, ["guid", "id"])) || url || `${title}:${rawDate}`;
     const author = plain(tag(block, ["dc:creator", "author", "name"])) || null;
     const image=imageFromBlock(block,baseUrl,title);
-    return { guid, url: url || guid, title, author, excerpt: cleanExcerpt(bodyText, title), body: body || null, published: parsed && !Number.isNaN(parsed.getTime()) ? parsed : null, imageUrl:image.url, imageAlt:image.alt };
+    // Only http(s) links are ever stored as the article URL: a feed item
+    // whose link uses another scheme (javascript:, data:, file:) or is
+    // missing is dropped rather than stored with the raw guid as its URL,
+    // which the reader would later render as a clickable link.
+    return { guid, url, title, author, excerpt: cleanExcerpt(bodyText, title), body: body || null, published: parsed && !Number.isNaN(parsed.getTime()) ? parsed : null, imageUrl:image.url, imageAlt:image.alt };
   }).filter((x) => x.url && x.guid);
 }
 function safeError(e: unknown): string {
@@ -213,13 +337,12 @@ function imageFormat(bytes:Uint8Array):{mime:"image/jpeg"|"image/png"|"image/gif
 }
 async function ownArticleImage(ctx:Ctx,articleId:number,url:string):Promise<{key:string;thumbKey:string|null}|null>{
   try{
-    const response=await fetch(url,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8,*/*;q=0.1"},signal:AbortSignal.timeout(15000),redirect:"follow"});
-    if(!response.ok)return null;
-    const declared=Number(response.headers.get("content-length")??"0");
-    if(declared>12_000_000)return null;
-    const bytes=new Uint8Array(await response.arrayBuffer());
-    if(!bytes.length||bytes.length>12_000_000)return null;
+    const fetched=await safeFetch(url,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8,*/*;q=0.1"},timeoutMs:15000,maxBytes:12_000_000});
+    if(!fetched.ok)return null;
+    const bytes=fetched.bytes;
+    if(!bytes.length)return null;
     const format=imageFormat(bytes); if(!format)return null;
+    const imgDims=imageDimensions(bytes); if(imgDims&&(imgDims.width>16384||imgDims.height>16384||imgDims.width*imgDims.height>40_000_000))return null;
     const key=`article-images/${articleId}.${format.ext}`;
     await ctx.blobs.put(key,bytes,{contentType:format.mime});
     // Eager list thumbnail (Phase 5): generated once here so list loads
@@ -558,16 +681,14 @@ async function ownPulledPhoto(ctx: Ctx, articleId: number, position: number, url
     // No AVIF in the Accept list: some CDNs (CBC's Akamai image manager)
     // negotiate AVIF when it is offered first, and AVIF bytes are not a
     // storable format here, so every photo would be rejected.
-    const response = await fetch(url, { headers: { "user-agent": BROWSER_UA, accept: "image/jpeg,image/png,image/gif,image/webp;q=0.8,*/*;q=0.3" }, signal: AbortSignal.timeout(15000), redirect: "follow" });
-    if (!response.ok) return null;
-    const declared = Number(response.headers.get("content-length") ?? "0");
-    if (declared > 12_000_000) return null;
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (!bytes.length || bytes.length > 12_000_000 || bytes.length < 6000) return null;
+    const fetched = await safeFetch(url, { headers: { "user-agent": BROWSER_UA, accept: "image/jpeg,image/png,image/gif,image/webp;q=0.8,*/*;q=0.3" }, timeoutMs: 15000, maxBytes: 12_000_000 });
+    if (!fetched.ok) return null;
+    const bytes = fetched.bytes;
+    if (!bytes.length || bytes.length < 6000) return null;
     const format = imageFormat(bytes);
     if (!format) return null;
     const dims = imageDimensions(bytes);
-    if (dims && (dims.width < 280 || dims.height < 120)) return null;
+    if (dims && (dims.width < 280 || dims.height < 120 || dims.width > 16384 || dims.height > 16384 || dims.width * dims.height > 40_000_000)) return null;
     const key = `article-photos/${articleId}-${position}.${format.ext}`;
     await ctx.blobs.put(key, bytes, { contentType: format.mime });
     return key;
@@ -743,25 +864,42 @@ async function deleteExpiredArticles(ctx: Ctx): Promise<number> {
     const tombstones = unique.slice(index, index + 200).map((row) => ({ feedId: row.feedId, guid: row.guid }));
     if (tombstones.length) await db.insert(schema.articleTombstones).values(tombstones).onConflictDoNothing();
   }
+  // Delete the rows FIRST, with the protection conditions re-asserted
+  // inside the DELETE itself: a star, note, or highlight saved after the
+  // selection above must win over this deletion, atomically. Only then
+  // are blobs cleaned up, and only for rows that were actually deleted,
+  // so a protected survivor never loses its images.
+  const deletedIds: number[] = [];
+  for (let index = 0; index < unique.length; index += 200) {
+    const ids = unique.slice(index, index + 200).map((row) => row.id);
+    if (ids.length) {
+      const deleted = await db.delete(schema.articles).where(and(
+        inArray(schema.articles.id, ids),
+        eq(schema.articles.starred, false),
+        sql`${schema.articles.id} not in (select ${schema.notes.articleId} from ${schema.notes})`,
+        sql`${schema.articles.id} not in (select ${schema.highlights.articleId} from ${schema.highlights})`,
+        sql`${schema.articles.feedId} in (select ${schema.feeds.id} from ${schema.feeds} where ${schema.feeds.keepForever} = 0)`,
+      )).returning({ id: schema.articles.id });
+      deletedIds.push(...deleted.map((d) => d.id));
+    }
+  }
+  const deletedSet = new Set(deletedIds);
   for (const row of unique) {
+    if (!deletedSet.has(row.id)) continue;
     if (row.imageBlobKey) await ctx.blobs.delete(row.imageBlobKey);
     await deleteThumbnailBlob(ctx, row.imageBlobKey, row.thumbnailBlobKey);
   }
-  await deletePhotosForArticles(ctx, unique.map((row) => row.id));
-  for (let index = 0; index < unique.length; index += 200) {
-    const ids = unique.slice(index, index + 200).map((row) => row.id);
-    if (ids.length) await db.delete(schema.articles).where(inArray(schema.articles.id, ids));
-  }
-  return unique.length;
+  await deletePhotosForArticles(ctx, deletedIds);
+  return deletedIds.length;
 }
 
 type Fetched = { feedId:number; ok:true; items:ReturnType<typeof parseFeed> } | { feedId:number; ok:false; error:string };
 async function fetchOne(feed: {id:number;url:string}): Promise<Fetched> {
   try {
-    const response = await fetch(feed.url, { headers: { "user-agent": "MuseNewsReader/1.0", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" }, signal: AbortSignal.timeout(18000), redirect: "follow" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const xml = await response.text();
-    const items = parseFeed(xml, response.url || feed.url);
+    const fetched = await safeFetch(feed.url, { headers: { "user-agent": "MuseNewsReader/1.0", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" }, timeoutMs: 18000, maxBytes: 12_000_000 });
+    if (!fetched.ok) throw new Error(`HTTP ${fetched.status}`);
+    const xml = new TextDecoder().decode(fetched.bytes);
+    const items = parseFeed(xml, fetched.finalUrl || feed.url);
     if (!items.length) throw new Error("No RSS or Atom entries found");
     return { feedId: feed.id, ok: true, items };
   } catch (e) { return { feedId: feed.id, ok: false, error: safeError(e) }; }
@@ -820,6 +958,11 @@ async function runRefreshInner(ctx: Ctx): Promise<{new_count:number;error_count:
     const deletedGuids = new Set(deletedRows.map((row) => row.guid));
     for (const item of result.items) {
       if (deletedGuids.has(item.guid)) continue;
+      // Re-check the tombstone at insert time: a delete that landed after
+      // the bulk check above (while this refresh was fetching other feeds)
+      // must not be undone by this insert resurrecting the article.
+      const [tomb] = await db.select({ guid: schema.articleTombstones.guid }).from(schema.articleTombstones).where(and(eq(schema.articleTombstones.feedId, result.feedId), eq(schema.articleTombstones.guid, item.guid))).limit(1);
+      if (tomb) continue;
       const inserted = await db.insert(schema.articles).values({feedId:result.feedId,guid:item.guid,url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,wordCount:bodyWordCount(item.body),publishedAt:item.published}).onConflictDoNothing().returning({id:schema.articles.id});
       const created=inserted[0];
       if (created) {
@@ -827,9 +970,14 @@ async function runRefreshInner(ctx: Ctx): Promise<{new_count:number;error_count:
         if (m) { const list=newByTheme.get(m.theme) ?? []; list.push({title:item.title,url:item.url,feed:m.feed,theme:m.theme,published_at:iso(item.published),excerpt:item.excerpt}); newByTheme.set(m.theme,list); }
         if(item.imageUrl)imageCandidates.push({articleId:created.id,url:item.imageUrl,alt:item.imageAlt??item.title,isNew:true});
       } else {
-        const [existing]=await db.select({id:schema.articles.id,imageBlobKey:schema.articles.imageBlobKey}).from(schema.articles).where(and(eq(schema.articles.feedId,result.feedId),eq(schema.articles.guid,item.guid))).limit(1);
+        const [existing]=await db.select({id:schema.articles.id,imageBlobKey:schema.articles.imageBlobKey,body:schema.articles.body}).from(schema.articles).where(and(eq(schema.articles.feedId,result.feedId),eq(schema.articles.guid,item.guid))).limit(1);
         if(existing){
-          await db.update(schema.articles).set({url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,body:item.body,wordCount:bodyWordCount(item.body),publishedAt:item.published}).where(eq(schema.articles.id,existing.id));
+          // Never downgrade the stored body: fetch_full_text may have
+          // replaced the feed snippet with the full article, and a later
+          // refresh re-offering the same item would silently revert it to
+          // the snippet. The longer body wins; metadata still updates.
+          const keepExistingBody = plain(existing.body ?? "").length > plain(item.body ?? "").length;
+          await db.update(schema.articles).set({url:item.url,title:item.title,author:item.author,excerpt:item.excerpt,...(keepExistingBody?{}:{body:item.body,wordCount:bodyWordCount(item.body)}),publishedAt:item.published}).where(eq(schema.articles.id,existing.id));
           if(item.imageUrl&&!existing.imageBlobKey)imageCandidates.push({articleId:existing.id,url:item.imageUrl,alt:item.imageAlt??item.title,isNew:false});
         }
       }
@@ -854,8 +1002,18 @@ async function runRefreshInner(ctx: Ctx): Promise<{new_count:number;error_count:
   }
   ctx.invalidateQueries(); return {new_count:newCount,error_count:errorCount,started_at:started.toISOString(),completed_at:completed.toISOString()};
 }
+// Refresh coalescing (red-team fix): the 30-minute cron and a manual
+// refresh (or two manual refreshes) could otherwise run concurrently,
+// doubling feed traffic and racing tombstone checks against article
+// deletes (a delete landing between a refresh's tombstone read and its
+// insert could resurrect the article). Concurrent callers in this process
+// now share the single in-flight run and its result.
+let refreshInFlight: Promise<{new_count:number;error_count:number;started_at:string;completed_at:string}> | null = null;
 async function runRefresh(ctx: Ctx): Promise<{new_count:number;error_count:number;started_at:string;completed_at:string}> {
-  return withPerf(ctx, "refresh_feeds", () => runRefreshInner(ctx));
+  if (refreshInFlight) return refreshInFlight;
+  const run = withPerf(ctx, "refresh_feeds", () => runRefreshInner(ctx));
+  refreshInFlight = run;
+  try { return await run; } finally { if (refreshInFlight === run) refreshInFlight = null; }
 }
 
 function articleOut(row: {id:number;title:string;url:string;author:string|null;excerpt:string|null;imageAlt:string|null;publishedAt:Date|null;ingestedAt:Date;readAt:Date|null;archivedAt:Date|null;starred:boolean;feedId:number;feed:string;theme:string;body?:string|null},imageUrl:string|null) {
@@ -911,7 +1069,7 @@ type LibraryItem = {id:number;kind:"note"|"highlight";text:string;created_at:str
 // Brief tab contract, shared by save_brief_edition (write) and get_brief
 // (read). The external pipeline identifies articles by URL only, so get_brief
 // resolves each URL against the saved articles table at read time.
-const briefArticleIn = z.object({ url: z.string().min(1).max(4000), feed: z.string().max(300), title: z.string().max(1000) });
+const briefArticleIn = z.object({ url: z.string().min(1).max(4000).refine((v) => isHttpUrl(v), "Article URLs must be http or https"), feed: z.string().max(300), title: z.string().max(1000) });
 const briefSignals = z.object({ sources: z.number(), consequence: z.number(), relevance: z.number(), novelty: z.number(), outrage: z.boolean() });
 const briefStoryIn = z.object({
   key: z.string().min(1).max(300), headline: z.string().min(1).max(600), summary: z.string().min(1).max(6000),
@@ -962,10 +1120,14 @@ const dossierOut = z.object({
 });
 type Dossier = z.infer<typeof dossierOut>;
 function isRecord(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null && !Array.isArray(v); }
-function strVal(v: unknown, fallback: string): string { return typeof v === "string" ? v : fallback; }
-function numVal(v: unknown, fallback: number): number { return typeof v === "number" && Number.isFinite(v) ? v : fallback; }
+function strVal(v: unknown, fallback: string): string { return typeof v === "string" ? v.slice(0, 20000) : fallback; }
+function numVal(v: unknown, fallback: number): number { return typeof v === "number" && Number.isFinite(v) ? Math.min(Math.abs(v), 1e12) * Math.sign(v) : fallback; }
 function boolVal(v: unknown, fallback: boolean): boolean { return typeof v === "boolean" ? v : fallback; }
-function strArr(v: unknown, fallback: string[]): string[] { return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : fallback; }
+function strArr(v: unknown, fallback: string[]): string[] { return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, 200).map((s) => s.slice(0, 2000)) : fallback; }
+// Dossier URLs are rendered as clickable links in the client, so only
+// http(s) URLs survive normalization; anything else becomes "" (rendered
+// as plain text) or drops the entry, for article links.
+function safeStoredUrl(v: unknown): string { return typeof v === "string" && isHttpUrl(v) ? v.slice(0, 4000) : ""; }
 function normalizeDossier(input: unknown, existing: Dossier | null): Dossier | null {
   if (!isRecord(input)) return null;
   const id = typeof input.id === "string" && input.id.trim() ? input.id.trim() : existing?.id;
@@ -983,19 +1145,19 @@ function normalizeDossier(input: unknown, existing: Dossier | null): Dossier | n
   const statusRaw = pick("status", base.status);
   const status: Dossier["status"] = statusRaw === "quiet" || statusRaw === "closed" || statusRaw === "active" ? statusRaw : base.status;
   const contestedRaw = pick("contested", base.contested);
-  const contested: Dossier["contested"] = Array.isArray(contestedRaw) ? contestedRaw.flatMap((c) => {
+  const contested: Dossier["contested"] = Array.isArray(contestedRaw) ? contestedRaw.slice(0, 100).flatMap((c) => {
     if (!isRecord(c) || typeof c.claim !== "string") return [];
     const st = c.status === "confirmed" || c.status === "reported" || c.status === "single_source" || c.status === "disputed" ? c.status : "reported";
-    return [{ claim: c.claim, status: st as Dossier["contested"][number]["status"], note: strVal(c.note, ""), sources: strArr(c.sources, []) }];
+    return [{ claim: c.claim.slice(0, 10000), status: st as Dossier["contested"][number]["status"], note: strVal(c.note, ""), sources: strArr(c.sources, []) }];
   }) : base.contested;
   const watchRaw = pick("what_to_watch", base.what_to_watch);
-  const what_to_watch: Dossier["what_to_watch"] = Array.isArray(watchRaw) ? watchRaw.flatMap((w) => isRecord(w) && typeof w.event === "string" ? [{ date: typeof w.date === "string" ? w.date : null, event: w.event }] : []) : base.what_to_watch;
+  const what_to_watch: Dossier["what_to_watch"] = Array.isArray(watchRaw) ? watchRaw.slice(0, 100).flatMap((w) => isRecord(w) && typeof w.event === "string" ? [{ date: typeof w.date === "string" ? w.date.slice(0, 40) : null, event: w.event.slice(0, 2000) }] : []) : base.what_to_watch;
   const timelineRaw = pick("timeline", base.timeline);
-  const timeline: Dossier["timeline"] = Array.isArray(timelineRaw) ? timelineRaw.flatMap((t) => isRecord(t) && typeof t.text === "string" ? [{ at: strVal(t.at, ""), text: t.text }] : []) : base.timeline;
+  const timeline: Dossier["timeline"] = Array.isArray(timelineRaw) ? timelineRaw.slice(0, 500).flatMap((t) => isRecord(t) && typeof t.text === "string" ? [{ at: strVal(t.at, ""), text: t.text.slice(0, 10000) }] : []) : base.timeline;
   const articlesRaw = pick("articles", base.articles);
-  const articles: Dossier["articles"] = Array.isArray(articlesRaw) ? articlesRaw.flatMap((a) => isRecord(a) && typeof a.url === "string" ? [{ feed: strVal(a.feed, ""), title: strVal(a.title, ""), url: a.url }] : []) : base.articles.map((a) => ({ feed: a.feed, title: a.title, url: a.url }));
+  const articles: Dossier["articles"] = Array.isArray(articlesRaw) ? articlesRaw.slice(0, 200).flatMap((a) => { if (!isRecord(a)) return []; const u = safeStoredUrl(a.url); return u ? [{ feed: strVal(a.feed, ""), title: strVal(a.title, ""), url: u }] : []; }) : base.articles.map((a) => ({ feed: a.feed, title: a.title, url: a.url }));
   const evidenceRaw = pick("evidence", base.evidence);
-  const evidence: Dossier["evidence"] = Array.isArray(evidenceRaw) ? evidenceRaw.flatMap((e) => isRecord(e) && typeof e.url === "string" ? [{ url: e.url, local_path: strVal(e.local_path, ""), kind: strVal(e.kind, ""), fetched_at: strVal(e.fetched_at, ""), bytes: numVal(e.bytes, 0) }] : []) : base.evidence.map((e) => ({ url: e.url, local_path: e.local_path, kind: e.kind, fetched_at: e.fetched_at, bytes: e.bytes }));
+  const evidence: Dossier["evidence"] = Array.isArray(evidenceRaw) ? evidenceRaw.slice(0, 100).flatMap((e) => isRecord(e) && typeof e.url === "string" ? [{ url: safeStoredUrl(e.url), local_path: strVal(e.local_path, ""), kind: strVal(e.kind, ""), fetched_at: strVal(e.fetched_at, ""), bytes: numVal(e.bytes, 0) }] : []) : base.evidence.map((e) => ({ url: e.url, local_path: e.local_path, kind: e.kind, fetched_at: e.fetched_at, bytes: e.bytes }));
   const scoresRaw = pick("scores", base.scores);
   const scores: Dossier["scores"] = isRecord(scoresRaw) ? { consequence: numVal(scoresRaw.consequence, base.scores.consequence), relevance: numVal(scoresRaw.relevance, base.scores.relevance), composite: numVal(scoresRaw.composite, base.scores.composite) } : base.scores;
   const contentionRaw = pick("contention", base.contention);
@@ -1004,15 +1166,15 @@ function normalizeDossier(input: unknown, existing: Dossier | null): Dossier | n
   let research: Dossier["research"] = base.research;
   if (isRecord(researchRaw)) {
     const rStatus = researchRaw.status === "queued" || researchRaw.status === "done" || researchRaw.status === "none" ? researchRaw.status : base.research.status;
-    const claimsRaw = Array.isArray(researchRaw.claims) ? researchRaw.claims : base.research.claims;
+    const claimsRaw = Array.isArray(researchRaw.claims) ? researchRaw.claims.slice(0, 100) : base.research.claims;
     const claims: Dossier["research"]["claims"] = claimsRaw.flatMap((c: unknown) => {
       if (!isRecord(c) || typeof c.claim !== "string") return [];
-      const evRaw = Array.isArray(c.evidence) ? c.evidence : [];
-      const evidence = evRaw.flatMap((e: unknown) => isRecord(e) ? [{ source: strVal(e.source, ""), url: strVal(e.url, ""), finding: strVal(e.finding, "") }] : []);
-      return [{ claim: c.claim, status: strVal(c.status, ""), evidence, note: strVal(c.note, "") }];
+      const evRaw = Array.isArray(c.evidence) ? c.evidence.slice(0, 50) : [];
+      const evidence = evRaw.flatMap((e: unknown) => isRecord(e) ? [{ source: strVal(e.source, ""), url: safeStoredUrl(e.url), finding: strVal(e.finding, "") }] : []);
+      return [{ claim: c.claim.slice(0, 10000), status: strVal(c.status, ""), evidence, note: strVal(c.note, "") }];
     });
-    const psRaw = Array.isArray(researchRaw.primary_sources) ? researchRaw.primary_sources : base.research.primary_sources;
-    const primary_sources: Dossier["research"]["primary_sources"] = psRaw.flatMap((p: unknown) => isRecord(p) ? [{ title: strVal(p.title, ""), url: strVal(p.url, ""), what: strVal(p.what, "") }] : []);
+    const psRaw = Array.isArray(researchRaw.primary_sources) ? researchRaw.primary_sources.slice(0, 100) : base.research.primary_sources;
+    const primary_sources: Dossier["research"]["primary_sources"] = psRaw.flatMap((p: unknown) => isRecord(p) ? [{ title: strVal(p.title, ""), url: safeStoredUrl(p.url), what: strVal(p.what, "") }] : []);
     research = {
       status: rStatus as Dossier["research"]["status"],
       at: typeof researchRaw.at === "string" ? researchRaw.at : researchRaw.at === null ? null : base.research.at,
@@ -1245,14 +1407,15 @@ export const Actions = {
       try { pageUrl = new URL(row.url); } catch { return { ok: false, body_chars: existingChars, error: "This article does not have a readable source link." }; }
       if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") return { ok: false, body_chars: existingChars, error: "This article does not have a readable source link." };
       let pageHtml = "";
+      let finalPageUrl = pageUrl.href;
       try {
-        const response = await fetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, signal: AbortSignal.timeout(20000), redirect: "follow" });
-        if (!response.ok) return { ok: false, body_chars: existingChars, error: `The source site returned HTTP ${response.status}.` };
-        pageHtml = await response.text();
+        const fetched = await safeFetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, timeoutMs: 20000, maxBytes: 8_000_000 });
+        if (!fetched.ok) return { ok: false, body_chars: existingChars, error: `The source site returned HTTP ${fetched.status}.` };
+        pageHtml = new TextDecoder().decode(fetched.bytes);
+        finalPageUrl = fetched.finalUrl;
       } catch { return { ok: false, body_chars: existingChars, error: "The source page could not be reached." }; }
       if (!pageHtml) return { ok: false, body_chars: existingChars, error: "Couldn't fetch the full text for this article." };
-      if (pageHtml.length > 8_000_000) pageHtml = pageHtml.slice(0, 8_000_000);
-      const extracted = extractFullTextHtml(pageHtml, pageUrl.href);
+      const extracted = extractFullTextHtml(pageHtml, finalPageUrl);
       const extractedChars = extracted ? plain(extracted).length : 0;
       if (!extracted || extractedChars < FULL_TEXT_MIN_CHARS) return { ok: false, body_chars: existingChars, error: "Couldn't fetch the full text for this article." };
       if (extractedChars <= existingChars) return { ok: false, body_chars: existingChars, error: "The source page didn't return more text than the feed already provided." };
@@ -1281,14 +1444,15 @@ export const Actions = {
       try { pageUrl = new URL(row.url); } catch { return { ok: false, count: 0, error: "This article does not have a readable source link." }; }
       if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") return { ok: false, count: 0, error: "This article does not have a readable source link." };
       let pageHtml = "";
+      let finalPageUrl = pageUrl.href;
       try {
-        const response = await fetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, signal: AbortSignal.timeout(20000), redirect: "follow" });
-        if (!response.ok) return { ok: false, count: 0, error: `The source site returned HTTP ${response.status}.` };
-        pageHtml = await response.text();
+        const fetched = await safeFetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, timeoutMs: 20000, maxBytes: 8_000_000 });
+        if (!fetched.ok) return { ok: false, count: 0, error: `The source site returned HTTP ${fetched.status}.` };
+        pageHtml = new TextDecoder().decode(fetched.bytes);
+        finalPageUrl = fetched.finalUrl;
       } catch { return { ok: false, count: 0, error: "The source page could not be reached." }; }
       if (!pageHtml) return { ok: false, count: 0, error: "Couldn't pull photos for this article." };
-      if (pageHtml.length > 8_000_000) pageHtml = pageHtml.slice(0, 8_000_000);
-      const candidates = extractPhotoCandidates(pageHtml, pageUrl.href);
+      const candidates = extractPhotoCandidates(pageHtml, finalPageUrl);
       if (!candidates.length) return { ok: false, count: 0, error: "No photos found on the source page." };
       const saved: Array<{ candidate: PhotoCandidate; key: string }> = [];
       for (let i = 0; i < candidates.length; i += 1) {
@@ -1298,6 +1462,16 @@ export const Actions = {
         if (key) saved.push({ candidate, key });
       }
       if (!saved.length) return { ok: false, count: 0, error: "No usable photos could be saved from the source page." };
+      // Concurrent-pull guard: two pulls of the same article (double tap,
+      // two tabs, a retry racing the original) both pass the early
+      // existing-photos check and download. Before inserting, re-check:
+      // if another pull already stored photos, drop this pull's blobs
+      // and report the stored set instead of duplicating every photo.
+      const racedExisting = await db.select({ id: schema.articlePhotos.id }).from(schema.articlePhotos).where(eq(schema.articlePhotos.articleId, row.id));
+      if (racedExisting.length) {
+        for (const s of saved) { try { await ctx.blobs.delete(s.key); } catch { /* already gone */ } }
+        return { ok: true, count: racedExisting.length, error: null };
+      }
       // Eager list thumbnails for the pulled photos (Phase 5), generated
       // once here alongside the photos themselves; best-effort per photo.
       const thumbKeys = await Promise.all(saved.map((s) => ensureThumbnailForKey(ctx, s.key)));
@@ -1343,8 +1517,8 @@ export const Actions = {
 
   markAllRead: defineAction({description: "Marks every unread article in the current view, theme, or feed as read.", request:z.object({view:z.enum(["Main","Theme","Feed"]),theme:z.string().optional(),feed_id:z.number().int().optional()}),response:z.object({updated:z.number()}),async handler(ctx,args){const db=ctx.db<typeof schema>();let ids:number[]=[];if(args.view==="Feed"){if(!args.feed_id)return{updated:0};ids=[args.feed_id];}else {const rows=await db.select({id:schema.feeds.id}).from(schema.feeds).innerJoin(schema.themes,eq(schema.feeds.themeId,schema.themes.id)).where(args.view==="Theme"&&args.theme?and(eq(schema.themes.name,args.theme),eq(schema.feeds.muted,false)):eq(schema.feeds.muted,false));ids=rows.map(r=>r.id);}if(!ids.length)return{updated:0};const changedAt=new Date();const updated=await db.update(schema.articles).set({readAt:changedAt,archivedAt:changedAt}).where(and(inArray(schema.articles.feedId,ids),isNull(schema.articles.readAt),isNull(schema.articles.archivedAt))).returning({id:schema.articles.id});ctx.invalidateQueries();return{updated:updated.length};}}),
 
-  saveNote: defineAction({description: "Saves or clears the note attached to an article.", request:z.object({article_id:z.number().int(),text:z.string().max(20000)}),response:z.object({ok:z.boolean()}),async handler(ctx,args){const db=ctx.db<typeof schema>();const text=args.text.trim();const [existing]=await db.select().from(schema.notes).where(eq(schema.notes.articleId,args.article_id)).limit(1);if(existing&&text)await db.update(schema.notes).set({text,updatedAt:new Date()}).where(eq(schema.notes.id,existing.id));else if(existing)await db.delete(schema.notes).where(eq(schema.notes.id,existing.id));else if(text)await db.insert(schema.notes).values({articleId:args.article_id,text});ctx.invalidateQueries();return{ok:true};}}),
-  saveHighlight: defineAction({description: "Saves a highlighted passage from an article.", request:z.object({article_id:z.number().int(),text:z.string().min(1).max(5000)}),response:z.object({id:z.number()}),async handler(ctx,args){const db=ctx.db<typeof schema>();const [row]=await db.insert(schema.highlights).values({articleId:args.article_id,text:args.text.trim()}).returning({id:schema.highlights.id});if(!row)throw new Error("Highlight could not be saved");ctx.invalidateQueries();return{id:row.id};}}),
+  saveNote: defineAction({description: "Saves or clears the note attached to an article.", request:z.object({article_id:z.number().int(),text:z.string().max(20000)}),response:z.object({ok:z.boolean()}),async handler(ctx,args){const db=ctx.db<typeof schema>();const text=args.text.trim();const [articleRow]=await db.select({id:schema.articles.id}).from(schema.articles).where(eq(schema.articles.id,args.article_id)).limit(1);if(!articleRow)throw new Error("Article not found");const [existing]=await db.select().from(schema.notes).where(eq(schema.notes.articleId,args.article_id)).limit(1);if(existing&&text)await db.update(schema.notes).set({text,updatedAt:new Date()}).where(eq(schema.notes.id,existing.id));else if(existing)await db.delete(schema.notes).where(eq(schema.notes.id,existing.id));else if(text)await db.insert(schema.notes).values({articleId:args.article_id,text});ctx.invalidateQueries();return{ok:true};}}),
+  saveHighlight: defineAction({description: "Saves a highlighted passage from an article.", request:z.object({article_id:z.number().int(),text:z.string().min(1).max(5000)}),response:z.object({id:z.number()}),async handler(ctx,args){const db=ctx.db<typeof schema>();const [articleRow]=await db.select({id:schema.articles.id}).from(schema.articles).where(eq(schema.articles.id,args.article_id)).limit(1);if(!articleRow)throw new Error("Article not found");const [row]=await db.insert(schema.highlights).values({articleId:args.article_id,text:args.text.trim()}).returning({id:schema.highlights.id});if(!row)throw new Error("Highlight could not be saved");ctx.invalidateQueries();return{id:row.id};}}),
   deleteHighlight: defineAction({description: "Deletes one saved highlight.", request:z.object({id:z.number().int()}),response:z.object({ok:z.boolean()}),async handler(ctx,args){await ctx.db<typeof schema>().delete(schema.highlights).where(eq(schema.highlights.id,args.id));ctx.invalidateQueries();return{ok:true};}}),
 
   library: defineAction({description: "Lists saved notes and highlights, optionally filtered by a search term.", request:z.object({search:z.string().default("")}),response:z.object({items:z.array(z.object({id:z.number(),kind:z.enum(["note","highlight"]),text:z.string(),created_at:z.string(),article_id:z.number(),article_title:z.string(),article_url:z.string(),feed:z.string(),theme:z.string()}))}),async handler(ctx,args){return{items:await loadLibrary(ctx,args.search)};}}),
@@ -1362,11 +1536,12 @@ export const Actions = {
       if(!theme) return {ok:false,id:null,title:null,added_count:0,error:"Choose an available category."};
       const [existing]=await db.select({id:schema.feeds.id,title:schema.feeds.title}).from(schema.feeds).where(eq(schema.feeds.url,url.href)).limit(1);
       if(existing) return {ok:false,id:existing.id,title:existing.title,added_count:0,error:"That feed is already in your subscriptions."};
+      if(!(await assertPublicUrl(url.href))) return {ok:false,id:null,title:null,added_count:0,error:"Feed URLs must point to a public http or https address."};
       try {
-        const response=await fetch(url.href,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"application/rss+xml, application/atom+xml, application/xml, text/xml, */*"},signal:AbortSignal.timeout(18000),redirect:"follow"});
-        if(!response.ok) throw new Error(`HTTP ${response.status}`);
-        const xml=await response.text();
-        const items=parseFeed(xml,response.url||url.href);
+        const fetched=await safeFetch(url.href,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"application/rss+xml, application/atom+xml, application/xml, text/xml, */*"},timeoutMs:18000,maxBytes:12_000_000});
+        if(!fetched.ok) throw new Error(`HTTP ${fetched.status}`);
+        const xml=new TextDecoder().decode(fetched.bytes);
+        const items=parseFeed(xml,fetched.finalUrl||url.href);
         if(!items.length) throw new Error("No RSS or Atom entries found");
         const suppliedTitle=args.title?.trim();
         const title=suppliedTitle||parseFeedTitle(xml)||url.hostname;
@@ -1386,7 +1561,7 @@ export const Actions = {
       } catch(e) { return {ok:false,id:null,title:null,added_count:0,error:safeError(e)}; }
     }
   }),
-  updateFeed: defineAction({description: "Updates a feed's muted state, keep-forever flag, or category.", request:z.object({id:z.number().int(),muted:z.boolean().optional(),keep_forever:z.boolean().optional(),theme_id:z.number().int().optional()}),response:z.object({ok:z.boolean()}),async handler(ctx,args){const values:{muted?:boolean;keepForever?:boolean;themeId?:number}={};if(args.muted!==undefined)values.muted=args.muted;if(args.keep_forever!==undefined)values.keepForever=args.keep_forever;if(args.theme_id!==undefined)values.themeId=args.theme_id;await ctx.db<typeof schema>().update(schema.feeds).set(values).where(eq(schema.feeds.id,args.id));ctx.invalidateQueries();return{ok:true};}}),
+  updateFeed: defineAction({description: "Updates a feed's muted state, keep-forever flag, or category.", request:z.object({id:z.number().int(),muted:z.boolean().optional(),keep_forever:z.boolean().optional(),theme_id:z.number().int().optional()}),response:z.object({ok:z.boolean()}),async handler(ctx,args){const db=ctx.db<typeof schema>();if(args.theme_id!==undefined){const [theme]=await db.select({id:schema.themes.id}).from(schema.themes).where(eq(schema.themes.id,args.theme_id)).limit(1);if(!theme)throw new Error("That category is no longer available.");}const values:{muted?:boolean;keepForever?:boolean;themeId?:number}={};if(args.muted!==undefined)values.muted=args.muted;if(args.keep_forever!==undefined)values.keepForever=args.keep_forever;if(args.theme_id!==undefined)values.themeId=args.theme_id;await db.update(schema.feeds).set(values).where(eq(schema.feeds.id,args.id));ctx.invalidateQueries();return{ok:true};}}),
   renameTheme: defineAction({
     description: "Renames a feed category.", request:z.object({id:z.number().int(),name:z.string().min(1).max(80)}),
     response:z.object({ok:z.boolean(),name:z.string().nullable(),error:z.string().nullable()}),
@@ -1664,6 +1839,11 @@ export const Actions = {
       for (const raw of args.dossiers) {
         const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : null;
         if (!id) continue;
+        // One dossier is one situation summary, never a document store:
+        // reject payloads far beyond any legitimate dossier so a crafted
+        // or runaway pipeline write cannot bloat the table (get_dossiers
+        // parses every stored document on each call).
+        try { if (JSON.stringify(raw).length > 512_000) continue; } catch { continue; }
         const [existingRow] = await db.select().from(schema.briefDossiers).where(eq(schema.briefDossiers.id, id)).limit(1);
         const existing = existingRow ? parseDossier(existingRow.data) : null;
         const normalized = normalizeDossier(raw, existing);
@@ -1706,10 +1886,17 @@ export const Actions = {
     request: z.object({ events: z.array(z.object({ metric: z.string().min(1).max(80), duration_ms: z.number().min(0).max(600000), bytes: z.number().int().min(0).max(100000000).optional(), phase: z.string().max(40).optional() })).min(1).max(50) }),
     response: z.object({ ok: z.boolean(), recorded: z.number() }),
     async handler(ctx, args) {
+      // Only the metrics the client actually measures are accepted, and
+      // samples are always tagged with the SERVER's current phase: a
+      // client-supplied metric name or phase could otherwise flood
+      // perf_events with junk rows or poison another phase's baseline
+      // comparisons in get_perf_report.
+      const CLIENT_PERF_METRICS = new Set(["client_inbox_first_paint", "client_inbox_first_paint_warm", "client_inbox_first_paint_cold", "client_article_open_render", "client_article_open_warm", "client_article_open_cold", "client_article_open_restored", "client_star_visual", "client_archive_visual"]);
       const phase = await getPerfPhase(ctx);
       let recorded = 0;
       for (const e of args.events) {
-        await recordPerf(ctx, e.metric, e.duration_ms, e.bytes ?? null, e.phase ?? phase);
+        if (!CLIENT_PERF_METRICS.has(e.metric)) continue;
+        await recordPerf(ctx, e.metric, e.duration_ms, e.bytes ?? null, phase);
         recorded += 1;
       }
       return { ok: true, recorded };
@@ -1728,8 +1915,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const current = await getPerfPhase(ctx);
       const rows = args.phase
-        ? await db.select().from(schema.perfEvents).where(eq(schema.perfEvents.phase, args.phase))
-        : await db.select().from(schema.perfEvents);
+        ? await db.select().from(schema.perfEvents).where(eq(schema.perfEvents.phase, args.phase)).orderBy(desc(schema.perfEvents.id)).limit(5000)
+        : await db.select().from(schema.perfEvents).orderBy(desc(schema.perfEvents.id)).limit(5000);
       const byMetric = new Map<string, { durations: number[]; bytes: number[] }>();
       for (const r of rows) {
         const entry = byMetric.get(r.metric) ?? { durations: [], bytes: [] };
