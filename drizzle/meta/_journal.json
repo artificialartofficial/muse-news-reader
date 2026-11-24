@@ -43,6 +43,48 @@
       "when": 1790618861564,
       "tag": "0006_add_article_tombstones",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794536384645,
+      "tag": "0007_add_brief_editions_and_feedback",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794537322266,
+      "tag": "0008_add_brief_downvote_feedback",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1794789679295,
+      "tag": "0009_add_brief_dossiers",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1794791979519,
+      "tag": "0010_add_brief_marks",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1795043100477,
+      "tag": "0011_reorder_themes_default_board_order",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1795517894269,
+      "tag": "0012_add_article_photos",
+      "breakpoints": true
     }
   ]
 }

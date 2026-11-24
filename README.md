@@ -6,6 +6,23 @@ keyboard navigation, stars, notes,
 highlights, full-text search, per-feed settings, OPML import/export, and
 automatic archiving and retention.
 
+Newer additions:
+
+- **Brief tab:** periodic story-cluster editions (produced by an external
+  pipeline and stored through the app's actions) with per-story feedback
+  (clicks, stars, dismissals, downvotes) that feeds back into ranking, plus
+  long-lived story dossiers that track developing stories across editions.
+- **Library hub:** starred articles, saved notes and highlights, and the
+  archive in one place.
+- **Fetch full text:** when a feed ships only a snippet (CBC is the classic
+  case), the reader can pull the full article text from the source page
+  server-side and store it as the article body.
+- **Pull photos:** a companion action that pulls the story's photos from the
+  source page, with captions and credits, and places them in the article at
+  their story positions.
+- **Swipe to archive:** list rows archive on a left swipe, with an undo
+  notice.
+
 This is the app source only. It ships with a few example feeds; add your own
 subscriptions through the app's add-feed flow or by importing an OPML file.
 
