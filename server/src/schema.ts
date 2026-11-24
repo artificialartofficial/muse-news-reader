@@ -122,6 +122,22 @@ export const perfEvents = sqliteTable("perf_events", {
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
 });
 
+// Security event log: one row per blocked or rejected operation the
+// red-team hardening turned away — SSRF blocks in the guarded fetch,
+// dangerous-scheme URLs stripped from feed/dossier content, log_perf
+// samples dropped by the metric allowlist (aggregated per call), and
+// feed additions (the auditable change to the subscription list).
+// Details hold host+path only: never query strings, credentials, tokens,
+// or article content. Bounded by recordSecurityEvent: rows older than
+// 180 days are pruned on write and the table is capped at 5,000 rows.
+export const securityEvents = sqliteTable("security_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  eventType: text("event_type", { enum: ["ssrf_blocked", "dangerous_scheme", "perf_drop", "feed_added"] }).notNull(),
+  source: text("source").notNull(),
+  detail: text("detail").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
+});
+
 export const pullRuns = sqliteTable("pull_runs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),

@@ -50,6 +50,68 @@ function perfPercentile(sorted: number[], p: number): number {
   return sorted[idx] ?? 0;
 }
 
+// --- Security event log ---------------------------------------------------
+// Records what the red-team hardening turns away, for a monthly review via
+// get_security_events: SSRF blocks in the guarded fetch, dangerous-scheme
+// URLs stripped from feed/dossier content, log_perf samples dropped by the
+// metric allowlist (one aggregated row per log_perf call, never one per
+// sample), and feed additions. Details carry host+path only — never query
+// strings (they can hold tokens), credentials, or article content.
+// Recording NEVER breaks the operation that triggered it: every failure
+// here is swallowed, and callers' block/allow decisions are unchanged.
+type SecurityEventType = "ssrf_blocked" | "dangerous_scheme" | "perf_drop" | "feed_added";
+const SECURITY_RETENTION_MS = 180 * 86400000;
+const SECURITY_MAX_ROWS = 5000;
+function hostPathForLog(raw: string): string {
+  // http(s): host + path only (URL parsing drops credentials from these
+  // fields; the query string and fragment are never included). Anything
+  // else logs as its bare scheme so a javascript:/data: payload is never
+  // copied into the log.
+  try {
+    const u = new URL(raw);
+    if (u.protocol === "http:" || u.protocol === "https:") return `${u.hostname}${u.pathname}`.slice(0, 300);
+    return u.protocol.replace(/:$/, "");
+  } catch { return "unparseable-url"; }
+}
+function dangerousSchemeOf(value: string): string | null {
+  // Browsers strip leading whitespace/control characters before reading a
+  // scheme, so do the same before matching the dangerous set.
+  const v = value.replace(/^[\s\u0000-\u0020]+/, "");
+  const m = v.match(/^(javascript|data|vbscript|file):/i);
+  return m?.[1] ? `${m[1].toLowerCase()}:` : null;
+}
+async function recordSecurityEvent(ctx: Ctx, eventType: SecurityEventType, source: string, detail: string): Promise<void> {
+  try {
+    const db = ctx.db<typeof schema>();
+    await db.insert(schema.securityEvents).values({ eventType, source: source.slice(0, 200), detail: detail.slice(0, 500) });
+    // Bound the log on write: drop rows past the 180-day retention, then
+    // cap the table at SECURITY_MAX_ROWS, oldest first out.
+    await db.delete(schema.securityEvents).where(lte(schema.securityEvents.createdAt, new Date(Date.now() - SECURITY_RETENTION_MS)));
+    const [countRow] = await db.select({ count: sql<number>`count(*)` }).from(schema.securityEvents);
+    const total = Number(countRow?.count ?? 0);
+    if (total > SECURITY_MAX_ROWS) {
+      const excess = await db.select({ id: schema.securityEvents.id }).from(schema.securityEvents).orderBy(schema.securityEvents.id).limit(total - SECURITY_MAX_ROWS);
+      const excessIds = excess.map((r) => r.id);
+      if (excessIds.length) await db.delete(schema.securityEvents).where(inArray(schema.securityEvents.id, excessIds));
+    }
+  } catch { /* Security logging must never fail the operation it records. */ }
+}
+// Aggregated dangerous-scheme sightings collected while parsing one feed
+// or upserting dossiers: key `${scheme}|${where}` -> count. Callers flush
+// the map once per operation so a hostile feed cannot flood the log.
+type SchemeSightings = Map<string, number>;
+function noteScheme(map: SchemeSightings | undefined, scheme: string, where: string): void {
+  if (!map) return;
+  const key = `${scheme}|${where}`;
+  map.set(key, (map.get(key) ?? 0) + 1);
+}
+async function flushSchemeSightings(ctx: Ctx, map: SchemeSightings, source: string): Promise<void> {
+  for (const [key, count] of map) {
+    const [scheme = "", where = ""] = key.split("|");
+    await recordSecurityEvent(ctx, "dangerous_scheme", source, `${scheme} stripped from ${where} (${count} occurrence${count === 1 ? "" : "s"})`);
+  }
+}
+
 // Example seed feeds. Replace with your own subscriptions, or import an OPML
 // file through the app's add-feed flow after first launch.
 const FEEDS = [
@@ -90,7 +152,7 @@ function plain(value: string): string {
 function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-function articleHtml(value: string, baseUrl: string): string {
+function articleHtml(value: string, baseUrl: string, schemeLog?: SchemeSightings): string {
   const decoded = decodeXml(value)
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<(script|style|iframe|object|embed|svg|form|template)\b[\s\S]*?<\/\1\s*>/gi, "");
@@ -110,7 +172,8 @@ function articleHtml(value: string, baseUrl: string): string {
         try {
           const href = new URL(rawHref, baseUrl);
           if (href.protocol === "http:" || href.protocol === "https:") result += `<a href="${escapeHtml(href.href)}" target="_blank" rel="noopener noreferrer">`;
-        } catch { /* Invalid or unsafe links are omitted while their text remains. */ }
+          else { const ds = dangerousSchemeOf(rawHref); if (ds) noteScheme(schemeLog, ds, "article body link"); }
+        } catch { const ds = dangerousSchemeOf(rawHref); if (ds) noteScheme(schemeLog, ds, "article body link"); /* Invalid or unsafe links are omitted while their text remains. */ }
       }
     } else if (allowed.has(name)) {
       const normalized = name === "b" ? "strong" : name === "i" ? "em" : name;
@@ -208,14 +271,18 @@ async function hostResolvesPrivate(hostname: string): Promise<boolean> {
   if (dnsCache.size > 500) dnsCache.clear();
   return blocked;
 }
-async function assertPublicUrl(raw: string): Promise<URL | null> {
+type AssertResult = { url: URL | null; reason: "invalid_url" | "scheme" | "credentials" | "blocked_literal" | "blocked_dns" | null };
+async function assertPublicUrlDetailed(raw: string): Promise<AssertResult> {
   let u: URL;
-  try { u = new URL(raw); } catch { return null; }
-  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-  if (u.username || u.password) return null;
-  if (hostIsBlockedLiteral(u.hostname)) return null;
-  if (await hostResolvesPrivate(u.hostname)) return null;
-  return u;
+  try { u = new URL(raw); } catch { return { url: null, reason: "invalid_url" }; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return { url: null, reason: "scheme" };
+  if (u.username || u.password) return { url: null, reason: "credentials" };
+  if (hostIsBlockedLiteral(u.hostname)) return { url: null, reason: "blocked_literal" };
+  if (await hostResolvesPrivate(u.hostname)) return { url: null, reason: "blocked_dns" };
+  return { url: u, reason: null };
+}
+async function assertPublicUrl(raw: string): Promise<URL | null> {
+  return (await assertPublicUrlDetailed(raw)).url;
 }
 async function readBodyCapped(response: Response, maxBytes: number): Promise<Uint8Array> {
   const declared = Number(response.headers.get("content-length") ?? "0");
@@ -236,9 +303,15 @@ async function readBodyCapped(response: Response, maxBytes: number): Promise<Uin
   return out;
 }
 type SafeFetchResult = { ok: boolean; status: number; finalUrl: string; bytes: Uint8Array };
-async function safeFetch(rawUrl: string, init: { headers: Record<string, string>; timeoutMs: number; maxBytes: number }): Promise<SafeFetchResult> {
-  let current = await assertPublicUrl(rawUrl);
-  if (!current) throw new Error("Blocked or invalid URL");
+async function safeFetch(rawUrl: string, init: { headers: Record<string, string>; timeoutMs: number; maxBytes: number; ctx?: Ctx; source?: string }): Promise<SafeFetchResult> {
+  // Every SSRF block is recorded (host+path only) with the caller's
+  // context when one is supplied; logging never changes the block.
+  const logBlock = async (raw: string, reason: string | null, hop: number) => {
+    if (init.ctx) await recordSecurityEvent(init.ctx, "ssrf_blocked", init.source ?? "safeFetch", `${reason ?? "blocked"} ${hostPathForLog(raw)}${hop > 0 ? ` (redirect hop ${hop})` : ""}`);
+  };
+  const first = await assertPublicUrlDetailed(rawUrl);
+  if (!first.url) { await logBlock(rawUrl, first.reason, 0); throw new Error("Blocked or invalid URL"); }
+  let current: URL = first.url;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), init.timeoutMs);
   try {
@@ -248,9 +321,10 @@ async function safeFetch(rawUrl: string, init: { headers: Record<string, string>
         const location = response.headers.get("location");
         try { await response.body?.cancel(); } catch { /* ignore */ }
         if (!location || hop === 5) return { ok: false, status: response.status, finalUrl: current.href, bytes: new Uint8Array() };
-        const next = await assertPublicUrl(new URL(location, current.href).href);
-        if (!next) throw new Error("Blocked redirect target");
-        current = next;
+        const nextRaw = new URL(location, current.href).href;
+        const nextCheck = await assertPublicUrlDetailed(nextRaw);
+        if (!nextCheck.url) { await logBlock(nextRaw, nextCheck.reason, hop + 1); throw new Error("Blocked redirect target"); }
+        current = nextCheck.url;
         continue;
       }
       if (!response.ok) return { ok: false, status: response.status, finalUrl: current.href, bytes: new Uint8Array() };
@@ -267,7 +341,7 @@ function parseFeedTitle(xml: string): string {
   return plain(tag(feedHeader, ["title"]));
 }
 type ParsedFeedItem = {guid:string;url:string;title:string;author:string|null;excerpt:string|null;body:string|null;published:Date|null;imageUrl:string|null;imageAlt:string|null};
-function imageFromBlock(block:string,baseUrl:string,title:string):{url:string|null;alt:string|null}{
+function imageFromBlock(block:string,baseUrl:string,title:string,schemeLog?:SchemeSightings):{url:string|null;alt:string|null}{
   const decoded=decodeXml(block);
   const attribute=(attrs:string,name:string)=>attrs.match(new RegExp(`\\b${name}=["']([^"']+)["']`,"i"))?.[1]??"";
   const candidates=[...decoded.matchAll(/<(media:content|media:thumbnail|enclosure)\b([^>]*)>/gi)];
@@ -276,11 +350,14 @@ function imageFromBlock(block:string,baseUrl:string,title:string):{url:string|nu
     const type=attribute(attrs,"type").toLowerCase(); const medium=attribute(attrs,"medium").toLowerCase();
     const appearsImage=kind==="media:thumbnail"||medium==="image"||type.startsWith("image/")||/\.(?:jpe?g|png|gif|webp)(?:$|[?#])/i.test(raw);
     if(!raw||!appearsImage)continue;
+    const ds=dangerousSchemeOf(raw); if(ds){noteScheme(schemeLog,ds,"feed image URL");continue;}
     const resolved=resolveUrl(raw,baseUrl);
     if(/^https?:\/\//i.test(resolved))return{url:resolved,alt:plain(tag(block,["media:title"]))||title};
   }
   const image=decoded.match(/<img\b([^>]*)>/i)?.[1]??"";
-  const raw=attribute(image,"src")||attribute(image,"data-src"); const resolved=resolveUrl(raw,baseUrl);
+  const raw=attribute(image,"src")||attribute(image,"data-src");
+  const ds=dangerousSchemeOf(raw); if(ds){noteScheme(schemeLog,ds,"feed image URL");return{url:null,alt:null};}
+  const resolved=resolveUrl(raw,baseUrl);
   return /^https?:\/\//i.test(resolved)?{url:resolved,alt:plain(attribute(image,"alt"))||title}:{url:null,alt:null};
 }
 function cleanExcerpt(bodyText: string, title: string): string | null {
@@ -299,22 +376,24 @@ function cleanExcerpt(bodyText: string, title: string): string | null {
   }
   return text ? text.slice(0, 360) : null;
 }
-function parseFeed(xml: string, baseUrl: string): ParsedFeedItem[] {
+function parseFeed(xml: string, baseUrl: string, schemeLog?: SchemeSightings): ParsedFeedItem[] {
   const rss = [...xml.matchAll(/<item\b[\s\S]*?<\/item>/gi)].map((m) => m[0]);
   const atom = rss.length ? [] : [...xml.matchAll(/<entry\b[\s\S]*?<\/entry>/gi)].map((m) => m[0]);
   const blocks = rss.length ? rss : atom;
   return blocks.slice(0, 30).map((block) => {
     const rawUrl = rss.length ? plain(tag(block, ["link"])) : attrLink(block);
+    const itemScheme = dangerousSchemeOf(rawUrl);
+    if (itemScheme) noteScheme(schemeLog, itemScheme, "feed item URL");
     const url = resolveUrl(rawUrl, baseUrl);
     const title = plain(tag(block, ["title"])) || "Untitled";
     const rawBody = tag(block, ["content:encoded", "content", "description", "summary"]);
     const bodyText = plain(rawBody);
-    const body = articleHtml(rawBody, url || baseUrl);
+    const body = articleHtml(rawBody, url || baseUrl, schemeLog);
     const rawDate = plain(tag(block, ["pubDate", "published", "updated", "dc:date"]));
     const parsed = rawDate ? new Date(rawDate) : null;
     const guid = plain(tag(block, ["guid", "id"])) || url || `${title}:${rawDate}`;
     const author = plain(tag(block, ["dc:creator", "author", "name"])) || null;
-    const image=imageFromBlock(block,baseUrl,title);
+    const image=imageFromBlock(block,baseUrl,title,schemeLog);
     // Only http(s) links are ever stored as the article URL: a feed item
     // whose link uses another scheme (javascript:, data:, file:) or is
     // missing is dropped rather than stored with the raw guid as its URL,
@@ -337,7 +416,7 @@ function imageFormat(bytes:Uint8Array):{mime:"image/jpeg"|"image/png"|"image/gif
 }
 async function ownArticleImage(ctx:Ctx,articleId:number,url:string):Promise<{key:string;thumbKey:string|null}|null>{
   try{
-    const fetched=await safeFetch(url,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8,*/*;q=0.1"},timeoutMs:15000,maxBytes:12_000_000});
+    const fetched=await safeFetch(url,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8,*/*;q=0.1"},timeoutMs:15000,maxBytes:12_000_000,ctx,source:`article_image article_id=${articleId}`});
     if(!fetched.ok)return null;
     const bytes=fetched.bytes;
     if(!bytes.length)return null;
@@ -681,7 +760,7 @@ async function ownPulledPhoto(ctx: Ctx, articleId: number, position: number, url
     // No AVIF in the Accept list: some CDNs (CBC's Akamai image manager)
     // negotiate AVIF when it is offered first, and AVIF bytes are not a
     // storable format here, so every photo would be rejected.
-    const fetched = await safeFetch(url, { headers: { "user-agent": BROWSER_UA, accept: "image/jpeg,image/png,image/gif,image/webp;q=0.8,*/*;q=0.3" }, timeoutMs: 15000, maxBytes: 12_000_000 });
+    const fetched = await safeFetch(url, { headers: { "user-agent": BROWSER_UA, accept: "image/jpeg,image/png,image/gif,image/webp;q=0.8,*/*;q=0.3" }, timeoutMs: 15000, maxBytes: 12_000_000, ctx, source: `fetch_photos photo article_id=${articleId}` });
     if (!fetched.ok) return null;
     const bytes = fetched.bytes;
     if (!bytes.length || bytes.length < 6000) return null;
@@ -894,12 +973,15 @@ async function deleteExpiredArticles(ctx: Ctx): Promise<number> {
 }
 
 type Fetched = { feedId:number; ok:true; items:ReturnType<typeof parseFeed> } | { feedId:number; ok:false; error:string };
-async function fetchOne(feed: {id:number;url:string}): Promise<Fetched> {
+async function fetchOne(feed: {id:number;url:string}, ctx?: Ctx): Promise<Fetched> {
   try {
-    const fetched = await safeFetch(feed.url, { headers: { "user-agent": "MuseNewsReader/1.0", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" }, timeoutMs: 18000, maxBytes: 12_000_000 });
+    const source = `feed_refresh feed_id=${feed.id}`;
+    const fetched = await safeFetch(feed.url, { headers: { "user-agent": "MuseNewsReader/1.0", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml, */*" }, timeoutMs: 18000, maxBytes: 12_000_000, ctx, source });
     if (!fetched.ok) throw new Error(`HTTP ${fetched.status}`);
     const xml = new TextDecoder().decode(fetched.bytes);
-    const items = parseFeed(xml, fetched.finalUrl || feed.url);
+    const schemeLog: SchemeSightings = new Map();
+    const items = parseFeed(xml, fetched.finalUrl || feed.url, schemeLog);
+    if (ctx && schemeLog.size) await flushSchemeSightings(ctx, schemeLog, source);
     if (!items.length) throw new Error("No RSS or Atom entries found");
     return { feedId: feed.id, ok: true, items };
   } catch (e) { return { feedId: feed.id, ok: false, error: safeError(e) }; }
@@ -941,7 +1023,7 @@ async function runRefreshInner(ctx: Ctx): Promise<{new_count:number;error_count:
   const db = ctx.db<typeof schema>(); const started = new Date();
   const [run] = await db.insert(schema.pullRuns).values({ startedAt: started, status: "running" }).returning({id:schema.pullRuns.id});
   const active = await db.select({id:schema.feeds.id,url:schema.feeds.url}).from(schema.feeds).where(eq(schema.feeds.muted,false));
-  const fetched = await concurrentMap(active, fetchOne, 8);
+  const fetched = await concurrentMap(active, (feed) => fetchOne(feed, ctx), 8);
   let newCount=0, errorCount=0;
   const newByTheme = new Map<string,Array<{title:string;url:string;feed:string;theme:string;published_at:string|null;excerpt:string|null}>>();
   const imageCandidates:Array<{articleId:number;url:string;alt:string;isNew:boolean}>=[];
@@ -1119,6 +1201,19 @@ const dossierOut = z.object({
   closing_summary: z.string().optional(),
 });
 type Dossier = z.infer<typeof dossierOut>;
+// Client-facing dossier shape: identical to the stored dossier except
+// evidence entries never carry local_path. local_path is a server-side
+// file path for the evidence locker (written by the external pipeline via
+// upsert_dossiers, which stays unchanged); it must never appear in any
+// response the client receives. The client only needs url/kind/fetched_at/
+// bytes to render the "Evidence on file" list, and dossier merges run
+// server-side (merge_dossiers) so no flow needs the path round-tripped.
+const dossierEvidencePublicOut = z.object({ url: z.string(), kind: z.string(), fetched_at: z.string(), bytes: z.number() });
+const dossierPublicOut = dossierOut.extend({ evidence: z.array(dossierEvidencePublicOut) });
+type DossierPublic = z.infer<typeof dossierPublicOut>;
+function toPublicDossier(d: Dossier): DossierPublic {
+  return { ...d, evidence: d.evidence.map((e) => ({ url: e.url, kind: e.kind, fetched_at: e.fetched_at, bytes: e.bytes })) };
+}
 function isRecord(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null && !Array.isArray(v); }
 function strVal(v: unknown, fallback: string): string { return typeof v === "string" ? v.slice(0, 20000) : fallback; }
 function numVal(v: unknown, fallback: number): number { return typeof v === "number" && Number.isFinite(v) ? Math.min(Math.abs(v), 1e12) * Math.sign(v) : fallback; }
@@ -1265,10 +1360,10 @@ async function withArticleIds(ctx: Ctx, dossiers: Dossier[]): Promise<Dossier[]>
   return dossiers.map((d) => ({ ...d, articles: d.articles.map((a) => ({ ...a, article_id: idByUrl.get(a.url) ?? null })) }));
 }
 const dossiersResponse = z.object({
-  dossiers: z.array(z.union([dossierOut, dossierSummaryOut])),
+  dossiers: z.array(z.union([dossierPublicOut, dossierSummaryOut])),
   suppressed: z.array(z.object({ id: z.string(), merged_into: z.string().nullable() })),
 });
-const dossierResponse = z.object({ dossier: dossierOut.nullable() });
+const dossierResponse = z.object({ dossier: dossierPublicOut.nullable() });
 const markOut = z.object({ dossier_id: z.string(), pinned: z.boolean(), viewed_at: z.string().nullable(), updated_at: z.string() });
 const marksResponse = z.object({ marks: z.array(markOut) });
 const okResponse = z.object({ ok: z.literal(true) });
@@ -1296,7 +1391,7 @@ export const Actions = {
       const db=ctx.db<typeof schema>();
       const [feed]=await db.select({id:schema.feeds.id,url:schema.feeds.url}).from(schema.feeds).where(eq(schema.feeds.title,"Marginal REVOLUTION")).limit(1);
       if(!feed)return{updated:0,error:"Marginal REVOLUTION feed is not subscribed."};
-      const result=await fetchOne(feed);
+      const result=await fetchOne(feed,ctx);
       if(!result.ok)return{updated:0,error:result.error};
       let updated=0;
       for(const item of result.items){
@@ -1405,11 +1500,11 @@ export const Actions = {
       const existingChars = plain(row.body ?? "").length;
       let pageUrl: URL;
       try { pageUrl = new URL(row.url); } catch { return { ok: false, body_chars: existingChars, error: "This article does not have a readable source link." }; }
-      if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") return { ok: false, body_chars: existingChars, error: "This article does not have a readable source link." };
+      if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") { const ds = dangerousSchemeOf(row.url); if (ds) await recordSecurityEvent(ctx, "dangerous_scheme", `fetch_full_text article_id=${row.id}`, `${ds} rejected as article URL`); return { ok: false, body_chars: existingChars, error: "This article does not have a readable source link." }; }
       let pageHtml = "";
       let finalPageUrl = pageUrl.href;
       try {
-        const fetched = await safeFetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, timeoutMs: 20000, maxBytes: 8_000_000 });
+        const fetched = await safeFetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, timeoutMs: 20000, maxBytes: 8_000_000, ctx, source: `fetch_full_text article_id=${row.id}` });
         if (!fetched.ok) return { ok: false, body_chars: existingChars, error: `The source site returned HTTP ${fetched.status}.` };
         pageHtml = new TextDecoder().decode(fetched.bytes);
         finalPageUrl = fetched.finalUrl;
@@ -1442,11 +1537,11 @@ export const Actions = {
       if (existing.length) return { ok: true, count: existing.length, error: null };
       let pageUrl: URL;
       try { pageUrl = new URL(row.url); } catch { return { ok: false, count: 0, error: "This article does not have a readable source link." }; }
-      if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") return { ok: false, count: 0, error: "This article does not have a readable source link." };
+      if (pageUrl.protocol !== "http:" && pageUrl.protocol !== "https:") { const ds = dangerousSchemeOf(row.url); if (ds) await recordSecurityEvent(ctx, "dangerous_scheme", `fetch_photos article_id=${row.id}`, `${ds} rejected as article URL`); return { ok: false, count: 0, error: "This article does not have a readable source link." }; }
       let pageHtml = "";
       let finalPageUrl = pageUrl.href;
       try {
-        const fetched = await safeFetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, timeoutMs: 20000, maxBytes: 8_000_000 });
+        const fetched = await safeFetch(pageUrl.href, { headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "accept-language": "en-CA,en;q=0.9" }, timeoutMs: 20000, maxBytes: 8_000_000, ctx, source: `fetch_photos article_id=${row.id}` });
         if (!fetched.ok) return { ok: false, count: 0, error: `The source site returned HTTP ${fetched.status}.` };
         pageHtml = new TextDecoder().decode(fetched.bytes);
         finalPageUrl = fetched.finalUrl;
@@ -1531,17 +1626,20 @@ export const Actions = {
       const db=ctx.db<typeof schema>();
       let url:URL;
       try { url=new URL(args.url.trim()); } catch { return {ok:false,id:null,title:null,added_count:0,error:"Enter a valid feed URL."}; }
-      if(url.protocol!=="https:"&&url.protocol!=="http:") return {ok:false,id:null,title:null,added_count:0,error:"Feed URLs must start with http:// or https://."};
+      if(url.protocol!=="https:"&&url.protocol!=="http:") { const ds=dangerousSchemeOf(args.url); if(ds) await recordSecurityEvent(ctx,"dangerous_scheme","addFeed",`${ds} rejected as feed URL`); return {ok:false,id:null,title:null,added_count:0,error:"Feed URLs must start with http:// or https://."}; }
       const [theme]=await db.select({id:schema.themes.id}).from(schema.themes).where(eq(schema.themes.id,args.theme_id)).limit(1);
       if(!theme) return {ok:false,id:null,title:null,added_count:0,error:"Choose an available category."};
       const [existing]=await db.select({id:schema.feeds.id,title:schema.feeds.title}).from(schema.feeds).where(eq(schema.feeds.url,url.href)).limit(1);
       if(existing) return {ok:false,id:existing.id,title:existing.title,added_count:0,error:"That feed is already in your subscriptions."};
-      if(!(await assertPublicUrl(url.href))) return {ok:false,id:null,title:null,added_count:0,error:"Feed URLs must point to a public http or https address."};
+      const publicCheck=await assertPublicUrlDetailed(url.href);
+      if(!publicCheck.url) { await recordSecurityEvent(ctx,"ssrf_blocked","addFeed",`${publicCheck.reason ?? "blocked"} ${hostPathForLog(url.href)}`); return {ok:false,id:null,title:null,added_count:0,error:"Feed URLs must point to a public http or https address."}; }
       try {
-        const fetched=await safeFetch(url.href,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"application/rss+xml, application/atom+xml, application/xml, text/xml, */*"},timeoutMs:18000,maxBytes:12_000_000});
+        const fetched=await safeFetch(url.href,{headers:{"user-agent":"MuseNewsReader/1.0",accept:"application/rss+xml, application/atom+xml, application/xml, text/xml, */*"},timeoutMs:18000,maxBytes:12_000_000,ctx,source:"addFeed"});
         if(!fetched.ok) throw new Error(`HTTP ${fetched.status}`);
         const xml=new TextDecoder().decode(fetched.bytes);
-        const items=parseFeed(xml,fetched.finalUrl||url.href);
+        const schemeLog:SchemeSightings=new Map();
+        const items=parseFeed(xml,fetched.finalUrl||url.href,schemeLog);
+        if(schemeLog.size) await flushSchemeSightings(ctx,schemeLog,"addFeed");
         if(!items.length) throw new Error("No RSS or Atom entries found");
         const suppliedTitle=args.title?.trim();
         const title=suppliedTitle||parseFeedTitle(xml)||url.hostname;
@@ -1556,6 +1654,7 @@ export const Actions = {
           if(created&&item.imageUrl)imageCandidates.push({articleId:created.id,url:item.imageUrl,alt:item.imageAlt??item.title});
         }
         await concurrentMap(imageCandidates,async candidate=>{const owned=await ownArticleImage(ctx,candidate.articleId,candidate.url);if(owned)await db.update(schema.articles).set({imageBlobKey:owned.key,thumbnailBlobKey:owned.thumbKey,imageAlt:candidate.alt}).where(eq(schema.articles.id,candidate.articleId));return owned;},6);
+        await recordSecurityEvent(ctx,"feed_added","addFeed",`${hostPathForLog(url.href)} · title: ${title.slice(0,120)}`);
         ctx.invalidateQueries();
         return {ok:true,id:feed.id,title,added_count:addedCount,error:null};
       } catch(e) { return {ok:false,id:null,title:null,added_count:0,error:safeError(e)}; }
@@ -1769,11 +1868,11 @@ export const Actions = {
       const byUpdatedDesc = (a: Dossier, b: Dossier) => (b.updated_at || "").localeCompare(a.updated_at || "");
       if (args.closed) {
         const closed = parsed.filter((d) => d.status === "closed").sort(byUpdatedDesc);
-        return { dossiers: await withArticleIds(ctx, closed), suppressed };
+        return { dossiers: (await withArticleIds(ctx, closed)).map(toPublicDossier), suppressed };
       }
       const open = parsed.filter((d) => d.status !== "closed").sort(byUpdatedDesc);
       if (args.summary) return { dossiers: open.map(summarizeDossier), suppressed };
-      return { dossiers: await withArticleIds(ctx, open), suppressed };
+      return { dossiers: (await withArticleIds(ctx, open)).map(toPublicDossier), suppressed };
     },
   }),
 
@@ -1787,7 +1886,7 @@ export const Actions = {
       const d = parseDossier(row.data);
       if (!d) return { dossier: null };
       const [withIds] = await withArticleIds(ctx, [d]);
-      return { dossier: withIds ?? d };
+      return { dossier: toPublicDossier(withIds ?? d) };
     },
   }),
 
@@ -1836,7 +1935,61 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const saved: string[] = [];
+      // Evidence local_path restore index: dossier reads never expose
+      // local_path to the client, so a client-originated upsert that
+      // carries evidence (e.g. an older client's merge payload) arrives
+      // without it. Rather than letting normalizeDossier blank the stored
+      // server-side path, resolve it back from stored evidence: exact
+      // url+fetched_at+kind match first, then a url that maps to exactly
+      // one stored path. Pipeline writes that carry local_path explicitly
+      // are untouched.
+      const storedRowsForPaths = await db.select().from(schema.briefDossiers);
+      const pathByExact = new Map<string, string>();
+      const pathsByUrl = new Map<string, Set<string>>();
+      for (const row of storedRowsForPaths) {
+        const stored = parseDossier(row.data);
+        if (!stored) continue;
+        for (const e of stored.evidence) {
+          if (!e.local_path) continue;
+          const exactKey = `${e.url}|${e.fetched_at}|${e.kind}`;
+          if (!pathByExact.has(exactKey)) pathByExact.set(exactKey, e.local_path);
+          const set = pathsByUrl.get(e.url) ?? new Set<string>();
+          set.add(e.local_path);
+          pathsByUrl.set(e.url, set);
+        }
+      }
+      // Dangerous-scheme scan over the URL-bearing fields: normalizeDossier
+      // strips these to "" via safeStoredUrl, and the stripping is logged
+      // (aggregated per call) with the dossier as context.
+      const dossierSchemeLog: SchemeSightings = new Map();
       for (const raw of args.dossiers) {
+        const urls: unknown[] = [];
+        if (Array.isArray(raw.articles)) for (const a of raw.articles) if (isRecord(a)) urls.push(a.url);
+        if (Array.isArray(raw.evidence)) for (const e of raw.evidence) if (isRecord(e)) urls.push(e.url);
+        if (isRecord(raw.research)) {
+          if (Array.isArray(raw.research.claims)) for (const c of raw.research.claims) if (isRecord(c) && Array.isArray(c.evidence)) for (const e of c.evidence) if (isRecord(e)) urls.push(e.url);
+          if (Array.isArray(raw.research.primary_sources)) for (const p of raw.research.primary_sources) if (isRecord(p)) urls.push(p.url);
+        }
+        for (const u of urls) { if (typeof u === "string") { const ds = dangerousSchemeOf(u); if (ds) noteScheme(dossierSchemeLog, ds, "dossier URL"); } }
+      }
+      if (dossierSchemeLog.size) await flushSchemeSightings(ctx, dossierSchemeLog, "upsert_dossiers");
+      const restoreEvidencePaths = (raw: Record<string, unknown>): Record<string, unknown> => {
+        if (!Array.isArray(raw.evidence)) return raw;
+        const evidence = raw.evidence.map((entry) => {
+          if (!isRecord(entry)) return entry;
+          if (typeof entry.local_path === "string" && entry.local_path) return entry;
+          if (typeof entry.url !== "string") return entry;
+          const exactKey = `${entry.url}|${typeof entry.fetched_at === "string" ? entry.fetched_at : ""}|${typeof entry.kind === "string" ? entry.kind : ""}`;
+          const exact = pathByExact.get(exactKey);
+          if (exact) return { ...entry, local_path: exact };
+          const byUrl = pathsByUrl.get(entry.url);
+          if (byUrl && byUrl.size === 1) return { ...entry, local_path: [...byUrl][0] ?? "" };
+          return entry;
+        });
+        return { ...raw, evidence };
+      };
+      for (const rawInput of args.dossiers) {
+        const raw = restoreEvidencePaths(rawInput);
         const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : null;
         if (!id) continue;
         // One dossier is one situation summary, never a document store:
@@ -1880,6 +2033,52 @@ export const Actions = {
     },
   }),
 
+  merge_dossiers: defineAction({
+    description: "Merges one Brief dossier into another entirely server-side (timeline, watch list, contested claims, source articles, evidence, and research are unioned from the stored dossiers, so server-only evidence fields survive), then closes the source dossier with merged_into pointing at the target.",
+    request: z.object({ source_id: z.string().min(1).max(300), target_id: z.string().min(1).max(300) }),
+    response: z.object({ ok: z.boolean(), error: z.string().nullable() }),
+    async handler(ctx, args): Promise<{ ok: boolean; error: string | null }> {
+      if (args.source_id === args.target_id) return { ok: false, error: "A dossier cannot be merged into itself." };
+      const db = ctx.db<typeof schema>();
+      const [sourceRow] = await db.select().from(schema.briefDossiers).where(eq(schema.briefDossiers.id, args.source_id)).limit(1);
+      const [targetRow] = await db.select().from(schema.briefDossiers).where(eq(schema.briefDossiers.id, args.target_id)).limit(1);
+      if (!sourceRow || !targetRow) return { ok: false, error: "That merge could not be completed." };
+      const source = parseDossier(sourceRow.data);
+      const target = parseDossier(targetRow.data);
+      if (!source || !target) return { ok: false, error: "That merge could not be completed." };
+      // Same union rules the client merge used before it moved server-side:
+      // target entries win ties, everything dedupes on its stable key.
+      const articleByUrl = new Map<string, Dossier["articles"][number]>();
+      for (const a of [...target.articles, ...source.articles]) {
+        if (!articleByUrl.has(a.url)) articleByUrl.set(a.url, { feed: a.feed, title: a.title, url: a.url });
+      }
+      const watchSeen = new Set<string>();
+      const what_to_watch = [...target.what_to_watch, ...source.what_to_watch].filter((w) => { const k = `${w.date ?? ""}|${w.event}`; if (watchSeen.has(k)) return false; watchSeen.add(k); return true; });
+      const psSeen = new Set<string>();
+      const primary_sources = [...target.research.primary_sources, ...source.research.primary_sources].filter((p) => { const k = p.url || p.title; if (psSeen.has(k)) return false; psSeen.add(k); return true; });
+      const evSeen = new Set<string>();
+      const evidence = [...target.evidence, ...source.evidence].filter((e) => { const k = `${e.url}|${e.local_path}`; if (evSeen.has(k)) return false; evSeen.add(k); return true; });
+      const nowIso = new Date().toISOString();
+      const merged: Dossier = {
+        ...target,
+        timeline: [...target.timeline, ...source.timeline].sort((a, b) => (a.at || "").localeCompare(b.at || "")),
+        what_to_watch,
+        contested: [...target.contested, ...source.contested],
+        articles: [...articleByUrl.values()],
+        evidence,
+        research: { ...target.research, claims: [...target.research.claims, ...source.research.claims], primary_sources, unverified: [...new Set([...target.research.unverified, ...source.research.unverified])] },
+        updated_at: nowIso,
+      };
+      const mergedUpdated = new Date(merged.updated_at);
+      await db.update(schema.briefDossiers).set({ data: JSON.stringify(merged), status: merged.status, updatedAt: Number.isNaN(mergedUpdated.getTime()) ? new Date() : mergedUpdated }).where(eq(schema.briefDossiers.id, target.id));
+      const closedSource: Dossier = { ...source, status: "closed", merged_into: target.id };
+      const closedUpdated = new Date(closedSource.updated_at);
+      await db.update(schema.briefDossiers).set({ data: JSON.stringify(closedSource), status: "closed", updatedAt: Number.isNaN(closedUpdated.getTime()) ? new Date() : closedUpdated }).where(eq(schema.briefDossiers.id, source.id));
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
+    },
+  }),
+
 
   log_perf: defineAction({
     description: "Records client-measured performance samples (tap-to-visual, article-open render, inbox first paint) into the perf log, fire-and-forget from the client.",
@@ -1894,12 +2093,34 @@ export const Actions = {
       const CLIENT_PERF_METRICS = new Set(["client_inbox_first_paint", "client_inbox_first_paint_warm", "client_inbox_first_paint_cold", "client_article_open_render", "client_article_open_warm", "client_article_open_cold", "client_article_open_restored", "client_star_visual", "client_archive_visual"]);
       const phase = await getPerfPhase(ctx);
       let recorded = 0;
+      let dropped = 0;
       for (const e of args.events) {
-        if (!CLIENT_PERF_METRICS.has(e.metric)) continue;
+        if (!CLIENT_PERF_METRICS.has(e.metric)) { dropped += 1; continue; }
         await recordPerf(ctx, e.metric, e.duration_ms, e.bytes ?? null, phase);
         recorded += 1;
       }
+      // Aggregated: one security row per log_perf call that dropped
+      // samples, never one row per dropped sample.
+      if (dropped > 0) await recordSecurityEvent(ctx, "perf_drop", "log_perf", `dropped ${dropped} sample${dropped === 1 ? "" : "s"} with non-allowlisted metric names in one call`);
       return { ok: true, recorded };
+    },
+  }),
+
+  get_security_events: defineAction({
+    description: "Returns recent security events (SSRF blocks, stripped dangerous-scheme URLs, dropped perf samples, feed additions) newest first, plus per-type counts, for periodic review.",
+    request: z.object({ limit: z.number().int().min(1).max(200).default(200) }),
+    response: z.object({
+      events: z.array(z.object({ id: z.number(), event_type: z.string(), source: z.string(), detail: z.string(), created_at: z.string() })),
+      counts: z.array(z.object({ event_type: z.string(), count: z.number() })),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.securityEvents).orderBy(desc(schema.securityEvents.id)).limit(args.limit);
+      const countRows = await db.select({ eventType: schema.securityEvents.eventType, count: sql<number>`count(*)` }).from(schema.securityEvents).groupBy(schema.securityEvents.eventType);
+      return {
+        events: rows.map((r) => ({ id: r.id, event_type: r.eventType, source: r.source, detail: r.detail, created_at: r.createdAt.toISOString() })),
+        counts: countRows.map((r) => ({ event_type: r.eventType, count: Number(r.count) })),
+      };
     },
   }),
 

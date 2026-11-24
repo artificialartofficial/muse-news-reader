@@ -692,36 +692,17 @@ export function App(){
   const runMerge=async(source:DossierRef,target:DossierRef)=>{
     setMerging(true);
     try{
-      const [s,t]=await Promise.all([api.get_dossier({id:source.id}),api.get_dossier({id:target.id})]);
-      const sourceFull=s.dossier; const targetFull=t.dossier;
-      if(!sourceFull||!targetFull){setNotice("That merge could not be completed.");return;}
-      const byKey=new Map<string,{feed:string;title:string;url:string}>();
-      for(const a of [...targetFull.articles,...sourceFull.articles]){
-        const key=a.article_id!==null&&a.article_id!==undefined?`id:${a.article_id}`:`url:${a.url}`;
-        if(!byKey.has(key))byKey.set(key,{feed:a.feed,title:a.title,url:a.url});
-      }
-      const watchSeen=new Set<string>();
-      const watch=[...targetFull.what_to_watch,...sourceFull.what_to_watch].filter(w=>{const k=`${w.date??""}|${w.event}`;if(watchSeen.has(k))return false;watchSeen.add(k);return true;});
-      const psSeen=new Set<string>();
-      const primarySources=[...targetFull.research.primary_sources,...sourceFull.research.primary_sources].filter(p=>{const k=p.url||p.title;if(psSeen.has(k))return false;psSeen.add(k);return true;});
-      const evSeen=new Set<string>();
-      const evidence=[...(targetFull.evidence??[]),...(sourceFull.evidence??[])].filter(e=>{const k=`${e.url}|${e.local_path}`;if(evSeen.has(k))return false;evSeen.add(k);return true;});
-      const merged={
-        ...targetFull,
-        timeline:[...targetFull.timeline,...sourceFull.timeline].sort((a,b)=>(a.at||"").localeCompare(b.at||"")),
-        what_to_watch:watch,
-        contested:[...targetFull.contested,...sourceFull.contested],
-        articles:[...byKey.values()],
-        evidence,
-        research:{...targetFull.research,claims:[...targetFull.research.claims,...sourceFull.research.claims],primary_sources:primarySources,unverified:[...new Set([...targetFull.research.unverified,...sourceFull.research.unverified])]},
-        updated_at:new Date().toISOString(),
-      };
-      await api.upsert_dossiers({dossiers:[merged as unknown as Record<string,unknown>]});
-      await api.upsert_dossiers({dossiers:[{id:source.id,status:"closed",merged_into:target.id}]});
+      // The merge runs entirely server-side (merge_dossiers): the client
+      // sends only the two dossier ids and the server unions the stored
+      // dossiers itself, so server-only evidence fields are
+      // preserved without ever being sent to or round-tripped through the
+      // client.
+      const result=await api.merge_dossiers({source_id:source.id,target_id:target.id});
+      if(!result.ok){setNotice("That merge could not be completed.");return;}
       invalidateDossiers();
       if(selectedDossierId===source.id)closeDossier();
       if(paneDossierId===source.id)setPaneDossierId(target.id);
-      setNotice(`Merged into “${targetFull.title}”`);
+      setNotice(`Merged into “${target.title}”`);
     }catch{setNotice("That merge could not be completed.");}
     finally{setMerging(false);setMergeSource(undefined);setMergeTarget(undefined);}
   };
